@@ -1,13 +1,18 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
+const backendPort = process.env.BACKEND_PORT ?? "8080";
+const backend = `http://localhost:${backendPort}`;
+const backendWs = `ws://localhost:${backendPort}`;
+
 export default defineConfig({
   plugins: [react()],
   server: {
-    port: 3000,
+    port: parseInt(process.env.FRONTEND_PORT ?? "3000"),
+    strictPort: false,   // auto-increment if port is taken
     proxy: {
-      "/api": "http://localhost:8080",
-      "/terminal": { target: "ws://localhost:8080", ws: true },
+      "/api": backend,
+      "/terminal": { target: backendWs, ws: true },
     },
   },
   build: {
