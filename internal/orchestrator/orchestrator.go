@@ -215,14 +215,18 @@ func NewSupervisor(cfg Config, opts ...Option) (*Supervisor, error) {
 		cfg.CIDMax = 1<<31 - 1
 	}
 
-	for _, p := range []string{cfg.KernelImagePath, cfg.RootfsPath} {
-		if _, err := os.Stat(p); err != nil {
-			return nil, fmt.Errorf("orchestrator: %s: %w", p, err)
+	// Image paths and cgroup v2 are only required when the jailer is active.
+	// In dev mode (UseJailer=false) the supervisor starts but will refuse Launch
+	// requests at runtime, which is the expected behaviour for local testing.
+	if cfg.UseJailer {
+		for _, p := range []string{cfg.KernelImagePath, cfg.RootfsPath} {
+			if _, err := os.Stat(p); err != nil {
+				return nil, fmt.Errorf("orchestrator: %s: %w", p, err)
+			}
 		}
-	}
-	// Confirm we are on a cgroup v2 host (unified hierarchy).
-	if _, err := os.Stat(filepath.Join(cfg.CgroupRoot, "cgroup.controllers")); err != nil {
-		return nil, fmt.Errorf("orchestrator: cgroup v2 not mounted at %s: %w", cfg.CgroupRoot, err)
+		if _, err := os.Stat(filepath.Join(cfg.CgroupRoot, "cgroup.controllers")); err != nil {
+			return nil, fmt.Errorf("orchestrator: cgroup v2 not mounted at %s: %w", cfg.CgroupRoot, err)
+		}
 	}
 
 	s := &Supervisor{
