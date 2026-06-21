@@ -1,0 +1,74 @@
+#!/usr/sbin/nft -f
+# sandbox.nft — Phase 6: nftables default-deny egress for sandbox VMs.
+#
+# Architecture:
+#   - All sandbox VMs are confined to a host-local subnet: 10.200.0.0/24
+#   - Each VM gets one TAP (vmtap-<id>) bridged into that subnet.
+#   - Default egress posture: DROP all output from the sandbox subnet.
+#   - Exception: allow traffic destined for the Squid forward proxy on the host
+#     (PROXY_HOST:3128) so agent VMs can reach allowlisted external APIs.
+#   - IMDS (169.254.169.254) is blocked at the firewall — this is the most
+#     important rule: it prevents guest code from stealing the host IAM role.
+#
+# Apply:
+#   nft -f deploy/firewall/sandbox.nft
+#
+# Flush:
+#   nft flush ruleset
+#
+# To make this permanent: copy to /etc/nftables.conf or drop in
+#   /etc/nftables.d/sandbox.nft and enable nftables.service.
+
+# ── constants ─────────────────────────────────────────────────────────────────
+
+define SANDBOX_NET   = 10.200.0.0/24
+define PROXY_HOST    = 10.200.0.1        # host TAP bridge IP / Squid listens here
+define PROXY_PORT    = 3128
+define IMDS_IP       = 169.254.169.254   # AWS/GCP/Azure IMDS — always block from guests
+
+# ── tables ────────────────────────────────────────────────────────────────────
+
+# Flush only the sandbox table so we don't disturb existing host rules.
+table ip sandbox {
+
+  # ── sandboxes → internet ─────────────────────────────────────────────────
+
+  chain sandbox_forward {
+    type filter hook forward priority filter; policy drop;
+
+    # Allow established/related replies back to sandboxes.
+    ct state { established, related } accept
+
+    # Allow sandboxes → Squid proxy only.
+    ip saddr $SANDBOX_NET ip daddr $PROXY_HOST tcp dport $PROXY_PORT accept
+
+    # Explicitly block IMDS from all sandbox VMs.
+    ip daddr $IMDS_IP drop
+
+    # All other forward traffic from the sandbox subnet: drop + log (rate limited).
+    ip saddr $SANDBOX_NET limit rate 10/minute log prefix "[sandbox-fw DROP] " drop
+  }
+
+  # ── sandboxes → host ──────────────────────────────────────────────────────
+  # Even traffic destined for the host is restricted. Sandboxes may only
+  # talk to the proxy port.
+
+  chain sandbox_input {
+    type filter hook input priority filter; policy accept;
+
+    # Allow sandboxes → host proxy.
+    ip saddr $SANDBOX_NET tcp dport $PROXY_PORT accept
+
+    # Drop all other input from the sandbox subnet to the host.
+    ip saddr $SANDBOX_NET drop
+  }
+
+  # ── host → sandboxes (responses only) ─────────────────────────────────────
+
+  chain sandbox_output {
+    type filter hook output priority filter; policy accept;
+
+    # No restrictions on host-initiated traffic to sandboxes
+    # (control-plane uses vsock, not the tap network).
+  }
+}

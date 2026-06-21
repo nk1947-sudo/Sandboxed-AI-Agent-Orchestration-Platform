@@ -1,0 +1,31 @@
+# Required built-in (=y) kernel options for Firecracker microVM guests.
+#
+# This fragment is appended to Firecracker's base microVM config by
+# scripts/build-kernel.sh, after which `make olddefconfig` resolves the rest and
+# scripts/check-kernel-config.sh asserts these stuck as built-in.
+#
+# Why built-in, not modules: Firecracker boots without an initramfs, so the
+# vsock transport and the root block device must be in the kernel image or the
+# guest cannot talk to the host or mount root.
+
+# --- virtio core + transports ---
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_MMIO=y
+CONFIG_VIRTIO_BLK=y
+
+# --- vsock (non-IP host<->guest RPC) ---
+CONFIG_VSOCKETS=y
+CONFIG_VIRTIO_VSOCKETS=y
+
+# --- root filesystem ---
+CONFIG_EXT4_FS=y
+
+# --- serial console (console=ttyS0) ---
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+
+# --- keep the image small & self-contained: no loadable modules ---
+CONFIG_MODULES=n
+
+# Note: we intentionally do NOT enable CONFIG_VIRTIO_NET here. The default
+# posture is none-networking; egress is an opt-in TAP added in Phase 6.

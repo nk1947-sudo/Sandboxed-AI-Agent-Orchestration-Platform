@@ -1,0 +1,32 @@
+# Build artifacts
+/bin/
+*.test
+coverage.out
+
+# Guest images & runtime sockets (never commit these)
+*.ext4
+vmlinux*
+deploy/kernel/microvm-kernel-*.config
+*.sock
+*.fifo
+
+# Jailer / per-VM state (created at runtime under /srv by default)
+/srv/
+
+# Frontend
+web/node_modules/
+web/dist/
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+
+# Local scratch
+_docx_extract.txt
+
+# Planning docs — local context only, not part of the distributed codebase
+planning/
+
+# Claude Code local settings — personal permissions, machine-specific
+.claude/

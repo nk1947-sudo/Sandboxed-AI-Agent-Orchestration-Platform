@@ -1,0 +1,189 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "develop"]
+  pull_request:
+    branches: ["main"]
+  # Nightly run at 02:00 UTC for the adversarial suite on the KVM runner.
+  schedule:
+    - cron: "0 2 * * *"
+  # Allow triggering adversarial tests manually from the Actions UI.
+  workflow_dispatch:
+    inputs:
+      scenarios:
+        description: "Adversarial scenario numbers (space-separated, e.g. '01 03')"
+        required: false
+        default: "01 02 03"
+
+# Cancel in-progress runs for the same branch on new pushes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ── unit ────────────────────────────────────────────────────────────────────
+  # Runs on every push and PR. No KVM or Linux binaries required.
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Unit tests (portable, -race)
+        run: go test -v -race -count=1 -timeout=120s ./...
+
+  # ── lint ────────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: "v1.61"
+          args: --timeout=5m
+
+  # ── security-regression ─────────────────────────────────────────────────────
+  # Exercises prior security fixes without KVM. Requires Linux for the
+  # gateway package (//go:build linux).
+  security-regression:
+    name: Security regression tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Security regression tests
+        run: go test -v -race -count=1 -timeout=60s ./test/security/
+
+  # ── cross-compile ────────────────────────────────────────────────────────────
+  # Catches type errors in linux-only files (orchestrator, gateway, snapshot)
+  # before they reach the KVM runner.
+  cross-compile:
+    name: Cross-compile linux/amd64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+
+      - name: go build (GOOS=linux)
+        run: GOOS=linux GOARCH=amd64 go build ./...
+
+      - name: go vet (GOOS=linux)
+        run: GOOS=linux GOARCH=amd64 go vet ./...
+
+  # ── integration ─────────────────────────────────────────────────────────────
+  # Boots real Firecracker microVMs. Requires a self-hosted runner labelled
+  # "kvm" with:
+  #   - /dev/kvm accessible and the runner user in the kvm group
+  #   - firecracker + jailer binaries on PATH (or set INT_FC_BIN / JAILER_BIN)
+  #   - vmlinux at INT_KERNEL and rootfs.ext4 at INT_ROOTFS (repository variables)
+  #
+  # Gates: runs on pushes to main, on nightly schedule, or when a PR is
+  # labelled "run-integration".
+  integration:
+    name: Integration tests (KVM)
+    runs-on: [self-hosted, kvm]
+    needs: [unit, cross-compile]
+    if: >
+      github.event_name == 'push' ||
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'run-integration')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+
+      - name: Verify KVM access
+        run: |
+          ls -la /dev/kvm
+          id
+
+      - name: Integration tests
+        run: |
+          go test -v -tags=integration -count=1 -timeout=600s \
+            ./internal/orchestrator/ \
+            ./test/integration/ \
+            ./test/bench/ \
+            ./test/load/
+        env:
+          INT_KERNEL:   ${{ vars.INT_KERNEL }}
+          INT_ROOTFS:   ${{ vars.INT_ROOTFS }}
+          INT_FC_BIN:   ${{ vars.INT_FC_BIN }}
+          BENCH_KERNEL: ${{ vars.INT_KERNEL }}
+          BENCH_ROOTFS: ${{ vars.INT_ROOTFS }}
+          LOAD_KERNEL:  ${{ vars.INT_KERNEL }}
+          LOAD_ROOTFS:  ${{ vars.INT_ROOTFS }}
+          LOAD_N: "5"
+
+  # ── adversarial ─────────────────────────────────────────────────────────────
+  # Three isolation scenarios (fork-bomb, traversal, exfil). A failure here
+  # is a release blocker, not a flake. Runs nightly and on manual dispatch.
+  adversarial:
+    name: Adversarial security scenarios (KVM)
+    runs-on: [self-hosted, kvm]
+    needs: [integration]
+    if: >
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'run-adversarial')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.x"
+          cache: true
+
+      - name: Make scripts executable
+        run: chmod +x test/adversarial/*.sh
+
+      - name: Run adversarial suite
+        run: |
+          sudo -E \
+            FC_KERNEL="${INT_KERNEL}" \
+            FC_ROOTFS="${INT_ROOTFS}" \
+            FC_BIN="${INT_FC_BIN:-firecracker}" \
+            RUN_ONLY="${{ github.event.inputs.scenarios || '01 02 03' }}" \
+            bash test/adversarial/run.sh
+        env:
+          INT_KERNEL: ${{ vars.INT_KERNEL }}
+          INT_ROOTFS: ${{ vars.INT_ROOTFS }}
+          INT_FC_BIN: ${{ vars.INT_FC_BIN }}

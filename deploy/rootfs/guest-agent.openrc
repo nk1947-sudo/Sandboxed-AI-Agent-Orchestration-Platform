@@ -1,0 +1,27 @@
+#!/sbin/openrc-run
+# OpenRC service that launches the sandbox guest agent on the vsock channel at
+# boot. The agent itself drops privileges to uid/gid 1000 for each script it
+# runs; it must start as root so it can chown /workspace and setuid children.
+#
+# Tunables are read from the environment by the agent (AGENT_VSOCK_PORT,
+# AGENT_UID, AGENT_WORKDIR, AGENT_DEFAULT_TIMEOUT_SEC, ...). Set them in
+# /etc/conf.d/guest-agent if you need to override the defaults.
+
+name="guest-agent"
+description="Sandboxed AI Agent RPC daemon (vsock:5005)"
+
+command="/usr/local/bin/guest_agent"
+command_background=true
+pidfile="/run/guest-agent.pid"
+output_log="/var/log/guest-agent.log"
+error_log="/var/log/guest-agent.log"
+
+# Supervise and auto-restart the daemon if it exits unexpectedly.
+supervisor="supervise-daemon"
+respawn_delay=2
+respawn_max=0
+
+depend() {
+	need localmount
+	after clock
+}

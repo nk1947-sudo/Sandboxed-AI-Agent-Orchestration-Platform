@@ -1,0 +1,70 @@
+[Unit]
+Description=Sandbox AI Agent Control Plane
+Documentation=https://github.com/yourorg/sandbox-platform
+After=network.target redis.service
+Requires=network.target
+
+[Service]
+# Run as root so the control plane can invoke the jailer (setuid-root) and
+# write to the /srv/jailer chroot base. The jailer itself demotes each VMM
+# to jaileruser (uid/gid 10001) inside a chroot + PID namespace.
+User=root
+Group=root
+
+ExecStart=/usr/local/bin/sandbox-controlplane
+
+# Restart policy: always restart except when explicitly stopped.
+Restart=on-failure
+RestartSec=5s
+
+# ── cgroup v2 delegation ─────────────────────────────────────────────────────
+# Delegate=yes grants this unit's cgroup subtree to the control plane so it
+# can manage its own child cgroups (one per sandbox VM) without relying on
+# systemd for each leaf. This is required for per-VM cpu/mem/pids capping.
+Delegate=yes
+
+# Inform systemd which controllers we will delegate.
+# Note: the 'pids' controller must be listed explicitly.
+DelegateControllers=cpu memory pids io
+
+# cgroup v2 unified hierarchy is required.
+# Ensure the host boots with "systemd.unified_cgroup_hierarchy=1" if not default.
+
+# ── limits ───────────────────────────────────────────────────────────────────
+LimitNOFILE=1048576
+LimitNPROC=65536
+LimitMEMLOCK=infinity
+
+# ── environment ──────────────────────────────────────────────────────────────
+EnvironmentFile=-/etc/sandbox-platform/controlplane.env
+
+# Explicit environment overrides (EnvironmentFile takes precedence when set).
+Environment=FC_BIN=/usr/local/bin/firecracker
+Environment=JAILER_BIN=/usr/local/bin/jailer
+Environment=KERNEL_IMAGE=/var/lib/sandbox/vmlinux-6.1
+Environment=ROOTFS_IMAGE=/var/lib/sandbox/rootfs.ext4
+Environment=CHROOT_BASE=/srv/jailer
+Environment=STATE_DIR=/srv/sandbox-state
+Environment=CGROUP_ROOT=/sys/fs/cgroup
+Environment=CGROUP_BASE=sandboxes
+Environment=USE_JAILER=true
+Environment=JAILER_UID=10001
+Environment=JAILER_GID=10001
+Environment=HTTP_ADDR=:8080
+Environment=REDIS_ADDR=127.0.0.1:6379
+
+# ── working directory and paths ──────────────────────────────────────────────
+WorkingDirectory=/srv/sandbox-state
+RuntimeDirectory=sandbox-controlplane
+RuntimeDirectoryMode=0750
+
+# ── security hardening for the control-plane process itself ──────────────────
+NoNewPrivileges=no   # Must be 'no': the control plane invokes setuid jailer.
+ProtectSystem=no     # Must be 'no': writes to /srv/jailer, /sys/fs/cgroup.
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=no    # Needs /dev/kvm indirectly via jailer.
+RestrictSUIDSGID=no  # jailer is setuid root — this must be off.
+
+[Install]
+WantedBy=multi-user.target
