@@ -136,6 +136,10 @@ func instanceToView(inst *orchestrator.Instance) vmView {
 }
 
 func (h *Handler) listVMs(w http.ResponseWriter, r *http.Request) {
+	if h.sup == nil {
+		writeJSON(w, http.StatusInternalServerError, errBody("supervisor unavailable"))
+		return
+	}
 	list := h.sup.List()
 	views := make([]vmView, 0, len(list))
 	for _, inst := range list {
@@ -153,6 +157,10 @@ type launchRequest struct {
 }
 
 func (h *Handler) launchVM(w http.ResponseWriter, r *http.Request) {
+	if h.sup == nil {
+		writeJSON(w, http.StatusInternalServerError, errBody("supervisor unavailable"))
+		return
+	}
 	var req launchRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, errBody("invalid JSON: "+err.Error()))
@@ -179,6 +187,10 @@ func (h *Handler) launchVM(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) terminateVM(w http.ResponseWriter, r *http.Request) {
+	if h.sup == nil {
+		writeJSON(w, http.StatusInternalServerError, errBody("supervisor unavailable"))
+		return
+	}
 	id := r.PathValue("id")
 	if id == "" {
 		writeJSON(w, http.StatusBadRequest, errBody("missing id"))

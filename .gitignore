@@ -2,6 +2,18 @@
 /bin/
 *.test
 coverage.out
+# Control-plane binary built directly into the repo root
+/controlplane
+
+# Local environment / secrets (never commit)
+.env
+.env.*
+!.env.example
+
+# Downloaded toolchains & release archives (fetched during deploy, not source)
+*.tgz
+*.tar.gz
+release-*/
 
 # Guest images & runtime sockets (never commit these)
 *.ext4

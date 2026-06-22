@@ -516,8 +516,19 @@ func (s *Supervisor) buildFirecrackerConfig(id string, cid uint32, spec LaunchSp
 		return firecracker.Config{}, bootPaths{}, fmt.Errorf("mkdir state dir: %w", err)
 	}
 	rootfsCopy := filepath.Join(stateDir, "rootfs.ext4")
-	if err := copyFile(s.cfg.RootfsPath, rootfsCopy, 0o600); err != nil {
+	if err := copyFile(s.cfg.RootfsPath, rootfsCopy, 0o660); err != nil {
 		return firecracker.Config{}, bootPaths{}, fmt.Errorf("copy rootfs: %w", err)
+	}
+	// The jailer demotes Firecracker to JailerGID; the drive must be
+	// group-readable/writable so virtio-blk can open it O_RDWR after chroot +
+	// setgid. Chmod explicitly (not just via the open mode) so the process umask
+	// cannot strip the group-write bit — without this the guest gets a
+	// read-only-permission file and boot fails with EACCES on drive attach.
+	if err := os.Chmod(rootfsCopy, 0o660); err != nil {
+		return firecracker.Config{}, bootPaths{}, fmt.Errorf("chmod rootfs copy: %w", err)
+	}
+	if err := os.Chown(rootfsCopy, 0, s.cfg.JailerGID); err != nil {
+		return firecracker.Config{}, bootPaths{}, fmt.Errorf("chown rootfs copy: %w", err)
 	}
 
 	const vsockName = "v.sock"

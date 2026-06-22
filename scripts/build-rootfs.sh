@@ -33,8 +33,14 @@ if command -v apk >/dev/null; then
 		alpine-base bash python3 ca-certificates openrc
 elif command -v docker >/dev/null; then
 	printf '[*] apk not on host; bootstrapping via docker...\n'
-	docker run --rm -v "$MNT:/rootfs" "alpine:${ALPINE}" sh -c \
-		"apk add --root /rootfs --initdb --no-cache alpine-base bash python3 ca-certificates openrc"
+	docker run --rm -v "$MNT:/rootfs" "alpine:${ALPINE}" sh -c "
+		mkdir -p /rootfs/etc/apk/keys
+		cp /etc/apk/keys/* /rootfs/etc/apk/keys/
+		apk add --root /rootfs --initdb --no-cache \
+			--repository https://dl-cdn.alpinelinux.org/alpine/v${ALPINE}/main \
+			--repository https://dl-cdn.alpinelinux.org/alpine/v${ALPINE}/community \
+			alpine-base bash python3 ca-certificates openrc
+	"
 else
 	printf '[!] need either apk or docker on the host to bootstrap Alpine\n' >&2
 	exit 1

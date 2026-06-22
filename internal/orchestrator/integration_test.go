@@ -212,9 +212,11 @@ func TestCgroupResourceCaps(t *testing.T) {
 
 // ── TestAdmissionControl ──────────────────────────────────────────────────────
 
-// TestAdmissionControl verifies that a supervisor with MaxConcurrent=2 rejects
-// a third concurrent launch with ErrAdmissionDenied.
-func TestAdmissionControl(t *testing.T) {
+// TestAdmissionControl_Integration verifies that a supervisor with
+// MaxConcurrent=2 rejects a third concurrent launch with ErrAdmissionDenied,
+// booting real microVMs. The unit-level admission test (no VM boot) lives in
+// orchestrator_test.go as TestAdmissionControl.
+func TestAdmissionControl_Integration(t *testing.T) {
 	kernel, rootfs := requireIntEnv(t)
 	tmp := t.TempDir()
 
