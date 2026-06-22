@@ -104,8 +104,15 @@ func (h *Handler) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 			next(w, r)
 			return
 		}
-		bearer := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if subtle.ConstantTimeCompare([]byte(bearer), []byte(h.cfg.Token)) != 1 {
+		// Browsers cannot set the Authorization header on a WebSocket handshake,
+		// so the /terminal endpoint authenticates via a ?token= query param.
+		// Prefer the header; fall back to the query param. Both are compared in
+		// constant time to avoid a timing oracle on the token.
+		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if tok == "" {
+			tok = r.URL.Query().Get("token")
+		}
+		if subtle.ConstantTimeCompare([]byte(tok), []byte(h.cfg.Token)) != 1 {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}

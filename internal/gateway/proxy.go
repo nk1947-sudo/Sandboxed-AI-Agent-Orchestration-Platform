@@ -124,14 +124,38 @@ func (p *terminalProxy) serve(
 		_ = conn.WriteMessage(websocket.TextMessage, b)
 	}
 
-	for {
-		_, msg, err := conn.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err,
-				websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-				p.log.Warn("terminal ws unexpected close", "sandbox", sandboxID, "err", err)
+	// A single reader goroutine owns conn.ReadMessage (gorilla permits only one
+	// concurrent reader). It publishes inbound frames on reads and closes done on
+	// any read error — i.e. when the client disconnects. done lets us cancel an
+	// in-flight HITL approval wait or guest exec the moment the operator's browser
+	// goes away, so an approved command is never executed for a dead session.
+	reads := make(chan []byte)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				if websocket.IsUnexpectedCloseError(err,
+					websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+					p.log.Warn("terminal ws unexpected close", "sandbox", sandboxID, "err", err)
+				}
+				return
 			}
-			return
+			select {
+			case reads <- msg:
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	for {
+		var msg []byte
+		select {
+		case <-done:
+			return // client disconnected
+		case msg = <-reads:
 		}
 
 		var req wsRequest
@@ -166,8 +190,15 @@ func (p *terminalProxy) serve(
 			}
 			send(wsEvent{Kind: evtPending, ApprovalID: approvalID, Reason: reason})
 
-			decision, err := p.gate.WaitForDecision(r.Context(), approvalID)
+			// Cancel the wait if the client disconnects, so we never execute an
+			// approved command for a session that has already gone away.
+			waitCtx, cancelWait := ctxUntilDone(r.Context(), done)
+			decision, err := p.gate.WaitForDecision(waitCtx, approvalID)
+			cancelWait()
 			if err != nil {
+				if waitCtx.Err() != nil {
+					return // client gone (or request cancelled) — end the session
+				}
 				send(wsEvent{Kind: evtError, Message: "approval wait interrupted"})
 				continue
 			}
@@ -187,7 +218,8 @@ func (p *terminalProxy) serve(
 			Env:        req.Env,
 		}
 
-		execErr := client.Exec(r.Context(), execReq, func(f protocol.ResponseFrame) {
+		execCtx, cancelExec := ctxUntilDone(r.Context(), done)
+		execErr := client.Exec(execCtx, execReq, func(f protocol.ResponseFrame) {
 			switch f.Kind {
 			case protocol.FrameOutput:
 				send(wsEvent{Kind: evtOutput, Data: f.Data})
@@ -195,11 +227,27 @@ func (p *terminalProxy) serve(
 				send(wsEvent{Kind: evtExit, ExitCode: f.ExitCode})
 			}
 		})
+		cancelExec()
 		if execErr != nil {
 			p.log.Warn("vsock exec error", "sandbox", sandboxID, "err", execErr)
 			send(wsEvent{Kind: evtError, Message: execErr.Error()})
 		}
 	}
+}
+
+// ctxUntilDone returns a child of parent that is cancelled when done is closed
+// (the terminal client disconnected) or when parent itself is cancelled. The
+// caller must invoke the returned cancel to release the watcher goroutine.
+func ctxUntilDone(parent context.Context, done <-chan struct{}) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+	go func() {
+		select {
+		case <-done:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
 }
 
 func newExecID() string {
