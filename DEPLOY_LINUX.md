@@ -1,5 +1,11 @@
 # Linux Deployment & Testing Guide
 
+> **On Windows with WSL2?** Use the dedicated, validated guide instead:
+> **[DEPLOY_WSL2.md](DEPLOY_WSL2.md)**. WSL2 exposes `/dev/kvm` via Hyper-V, so the
+> full Firecracker stack runs there — but the exact image URLs, ports, and gotchas
+> differ from a native host. This document targets **bare-metal / native Linux
+> servers** (and nested-virt VMs that pass through KVM).
+
 This guide gives you **two paths**:
 
 | Path | Time | Requires KVM? | What you can test |
@@ -21,7 +27,8 @@ lsb_release -a
 
 # KVM availability (only needed for Path B)
 ls -la /dev/kvm
-# If this errors: you need bare-metal, WSL2 on Windows 11, or a nested-virt VM
+# If this errors: you need bare-metal KVM or a nested-virt VM that passes through
+# /dev/kvm. On Windows, use WSL2 — see DEPLOY_WSL2.md.
 
 # cgroup v2 (required for Path B)
 mount | grep cgroup2
@@ -418,17 +425,25 @@ Expected response:
 ```bash
 # List running VMs
 curl -s -H "Authorization: Bearer $TOKEN" $BASE/api/vms | python3 -m json.tool
+```
 
-# Connect to the terminal (install websocat for WS testing)
-sudo apt-get install -y websocat   # or: cargo install websocat
+**Exec into the guest.** The simplest option is the shipped Python WS client
+(`websocat` is not in most apt repos):
 
-SANDBOX_ID="sb-xxxxxxxx"   # replace with actual ID from launch response
-websocat "ws://localhost:8080/terminal?sandbox=${SANDBOX_ID}&token=${TOKEN}"
+```bash
+pip3 install --user websockets || pip3 install --user --break-system-packages websockets
 
-# Once connected, type commands:
-echo "hello from inside the microVM"
-uname -a
-ls /workspace
+SANDBOX_ID="sb-xxxxxxxx"   # replace with the ID from the launch response
+PORT=8080 TOKEN=$TOKEN python3 scripts/test-terminal.py "$SANDBOX_ID" \
+  "id; uname -a; echo hello-from-guest; ls -la /workspace"
+# Expect: runs as uid 1000(agentuser), then [exit code=0]
+```
+
+Or, if you have `websocat` (`cargo install websocat`):
+
+```bash
+websocat -H "Authorization: Bearer ${TOKEN}" \
+  "ws://localhost:8080/terminal?sandbox=${SANDBOX_ID}"
 ```
 
 ### B11 — Test the HITL gate
@@ -436,10 +451,11 @@ ls /workspace
 ```bash
 SANDBOX_ID="sb-xxxxxxxx"
 
-# This command will be intercepted by the HITL classifier
-websocat "ws://localhost:8080/terminal?sandbox=${SANDBOX_ID}&token=${TOKEN}"
-# Type: curl https://example.com
-# The terminal pauses with a "pending" event
+# This command is intercepted by the HITL classifier and held (not executed).
+# The client disables WS keepalive pings so it waits through a human approval.
+PORT=8080 TOKEN=$TOKEN python3 scripts/test-terminal.py "$SANDBOX_ID" \
+  "curl https://example.com"
+# Prints: [HITL pending] approval_id=<ID>  — then waits
 ```
 
 In another terminal, approve or reject it:

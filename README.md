@@ -4,6 +4,15 @@
 
 Every agent runs inside its own Firecracker microVM (a full guest kernel over KVM), not a container. The host filesystem, network stack, and credential metadata are structurally unreachable — not filtered by string patterns. A built-in Human-in-the-Loop (HITL) gate intercepts sensitive commands before they execute and holds them for operator approval through the web UI.
 
+### 📦 Deployment guides
+
+| Platform | Guide | What it covers |
+|---|---|---|
+| **Windows 11 + WSL2** | **[DEPLOY_WSL2.md](DEPLOY_WSL2.md)** | Validated end-to-end: real Firecracker microVMs over WSL2's Hyper-V `/dev/kvm`, exact image URLs, ports, and gotchas. |
+| **Native / bare-metal Linux** | **[DEPLOY_LINUX.md](DEPLOY_LINUX.md)** | Two paths — dev mode (no KVM) and the full Firecracker stack — for Linux servers and nested-virt VMs. |
+
+The [Getting Started](#getting-started--local-development) section below is the condensed quick-start; use the guides above for a step-by-step, copy-paste deployment.
+
 ---
 
 ## Table of Contents
@@ -99,8 +108,8 @@ Every agent runs inside its own Firecracker microVM (a full guest kernel over KV
 | Firecracker | ≥ 1.5 | [GitHub releases](https://github.com/firecracker-microvm/firecracker/releases) |
 | Firecracker jailer | same release as FC | ships alongside the FC binary |
 | Redis | ≥ 7.0 | HITL queue, state, rate-limiting |
-| vmlinux | 5.10 microVM build | see `scripts/01-build-kernel.sh` |
-| rootfs.ext4 | Alpine-based | see `scripts/02-build-rootfs.sh` |
+| vmlinux | 5.10 microVM build | see `scripts/build-kernel.sh` |
+| rootfs.ext4 | Alpine-based | see `scripts/build-rootfs.sh` |
 
 ### Web Dashboard (any OS)
 
@@ -127,14 +136,14 @@ cd Sandboxed-AI-Agent-Orchestration-Platform
 sudo apt install -y build-essential libncurses-dev bison flex libssl-dev \
   libelf-dev squashfs-tools debootstrap qemu-utils
 
-# Build the microVM kernel (~5 min)
-bash scripts/01-build-kernel.sh
+# Build the microVM kernel (~20–40 min) — or use a pre-built vmlinux (see deploy guides)
+bash scripts/build-kernel.sh
 
-# Build the Alpine rootfs with the Go guest agent baked in (~3 min)
-bash scripts/02-build-rootfs.sh
+# Build the Alpine rootfs with the Go guest agent baked in (~5 min; needs Docker or apk)
+sudo bash scripts/build-rootfs.sh
 ```
 
-Output: `build/vmlinux` and `build/rootfs.ext4`.
+Output: `vmlinux` and `rootfs.ext4` (copy them to `/var/lib/sandbox/`).
 
 ### 3. Host setup (production jailer mode)
 
@@ -193,27 +202,32 @@ Open `http://localhost:3000`, enter your `API_TOKEN`, and sign in.
 
 Copy `.env.example` to `.env` and populate the values below. The control plane reads all configuration from environment; there is no config file.
 
+> Variable names below match `loadConfig()` in `cmd/controlplane/main.go` exactly.
+
 ### Required
 
 | Variable | Description | Example |
 |---|---|---|
 | `API_TOKEN` | Bearer token for all API and WS connections. Empty = auth disabled (dev only). | `change-me-in-production` |
 | `REDIS_ADDR` | Redis address for HITL queue, state, and rate-limiting. | `127.0.0.1:6379` |
-| `KERNEL_IMAGE_PATH` | Host path to the built microVM kernel (`vmlinux`). | `/srv/images/vmlinux` |
-| `ROOTFS_PATH` | Host path to the golden rootfs image (`rootfs.ext4`). | `/srv/images/rootfs.ext4` |
+| `KERNEL_IMAGE` | Host path to the built microVM kernel (`vmlinux`). | `/var/lib/sandbox/vmlinux` |
+| `ROOTFS_IMAGE` | Host path to the golden rootfs image (`rootfs.ext4`). | `/var/lib/sandbox/rootfs.ext4` |
+
+Defaults: `KERNEL_IMAGE=/var/lib/sandbox/vmlinux-6.1`, `ROOTFS_IMAGE=/var/lib/sandbox/rootfs.ext4`.
 
 ### Jailer & Isolation
 
 | Variable | Description | Default |
 |---|---|---|
 | `USE_JAILER` | `true` in production; `false` for dev without root. | `true` |
-| `FIRECRACKER_BIN` | Path to the firecracker binary. | `firecracker` |
+| `FC_BIN` | Path to the firecracker binary. | `firecracker` |
 | `JAILER_BIN` | Path to the jailer binary. | `jailer` |
-| `CHROOT_BASE_DIR` | Base directory for per-VM jailer chroots. | `/srv/jailer` |
+| `CHROOT_BASE` | Base directory for per-VM jailer chroots. | `/srv/jailer` |
+| `JAILER_UID` | Unprivileged uid the VMM is demoted to. | `10001` |
+| `JAILER_GID` | Unprivileged gid the VMM is demoted to. | `10001` |
 | `STATE_DIR` | Per-VM runtime state (sockets, rootfs copies). | `/srv/sandbox-state` |
 | `CGROUP_ROOT` | cgroup v2 mount point. | `/sys/fs/cgroup` |
 | `CGROUP_BASE` | Parent cgroup leaf for all sandboxes. | `sandboxes` |
-| `KERNEL_ARGS` | Guest kernel command line (overrides built-in default). | *(see source)* |
 
 ### Admission Control
 
@@ -226,20 +240,20 @@ Copy `.env.example` to `.env` and populate the values below. The control plane r
 
 | Variable | Description | Default |
 |---|---|---|
-| `LISTEN_ADDR` | HTTP/WS listen address. | `:8080` |
+| `HTTP_ADDR` | HTTP/WS listen address. | `:8080` |
 | `ALLOWED_ORIGINS` | Comma-separated WebSocket CORS allowlist. Empty = same-host only. | *(empty)* |
 
-### HITL
+### Redis, HITL & Runtime
 
 | Variable | Description | Default |
 |---|---|---|
-| `HITL_APPROVE_TTL` | Duration an approval request stays pending before it expires. | `10m` |
-
-### Shutdown
-
-| Variable | Description | Default |
-|---|---|---|
-| `SHUTDOWN_TERMINATES_ALL` | Terminate all running VMs on graceful shutdown. | `false` |
+| `REDIS_PASSWORD` | Redis auth password (set with `requirepass`). | *(empty)* |
+| `REDIS_DB` | Redis logical database index. | `0` |
+| `HITL_TTL_SEC` | Seconds an approval request stays pending before it expires. | `3600` |
+| `VSOCK_RETRY_MAX` | Max vsock dial retries while a guest finishes booting. | `10` |
+| `HEARTBEAT_TTL_SEC` | Sandbox heartbeat TTL in Redis. | `15` |
+| `HEALTH_INTERVAL_SEC` | Reaper / health-loop interval. | `5` |
+| `SHUTDOWN_TERMINATES_ALL` | Terminate all running VMs on graceful shutdown. | `true` |
 
 ---
 
@@ -273,10 +287,10 @@ services:
     environment:
       - API_TOKEN=${API_TOKEN}
       - REDIS_ADDR=redis:6379
-      - KERNEL_IMAGE_PATH=/srv/images/vmlinux
-      - ROOTFS_PATH=/srv/images/rootfs.ext4
+      - KERNEL_IMAGE=/srv/images/vmlinux
+      - ROOTFS_IMAGE=/srv/images/rootfs.ext4
       - USE_JAILER=true
-      - LISTEN_ADDR=:8080
+      - HTTP_ADDR=:8080
       - ALLOWED_ORIGINS=https://dashboard.yourdomain.com
     depends_on:
       - redis
@@ -392,9 +406,15 @@ curl -s -X DELETE http://localhost:8080/api/vms/sb-a3f9c2 \
 
 ### Open a streaming terminal (WebSocket)
 
+Auth is the `Authorization: Bearer` header (not a query param). The repo ships a
+Python client so you don't need `websocat`:
+
 ```bash
-# Using websocat (https://github.com/vi/websocat)
-websocat "ws://localhost:8080/terminal?sandbox=sb-a3f9c2&token=dev"
+# Shipped client — runs a script in the guest and streams output/HITL events
+PORT=8080 TOKEN=dev python3 scripts/test-terminal.py sb-a3f9c2 "uname -a; id"
+
+# Or with websocat (cargo install websocat):
+websocat -H "Authorization: Bearer dev" "ws://localhost:8080/terminal?sandbox=sb-a3f9c2"
 ```
 
 ### List pending HITL approvals
@@ -537,10 +557,12 @@ sudo FC_KERNEL=/path/to/vmlinux FC_ROOTFS=/path/to/rootfs.ext4 \
 │   └── state/               # Redis persistence, heartbeats, rate-limit token bucket
 ├── web/                     # React 18 + TypeScript + Tailwind + xterm.js dashboard
 ├── scripts/
-│   ├── 01-build-kernel.sh   # Build microVM vmlinux
-│   ├── 02-build-rootfs.sh   # Build Alpine ext4 rootfs with guest agent
+│   ├── build-kernel.sh      # Build microVM vmlinux
+│   ├── build-rootfs.sh      # Build Alpine ext4 rootfs with guest agent (Docker/apk)
 │   ├── host-jailer-setup.sh # jaileruser, /srv paths, KVM ACL, binary capabilities
+│   ├── host-kvm-setup.sh    # KVM group/ACL host prep
 │   ├── build-seccomp.sh     # Compile seccomp-BPF filters via seccompiler-bin
+│   ├── test-terminal.py     # WebSocket exec/HITL test client (no websocat needed)
 │   └── vm-tap.sh            # Create/destroy per-VM TAP device for opt-in egress
 ├── deploy/
 │   ├── firewall/sandbox.nft # nftables default-deny ruleset for sandbox subnet
