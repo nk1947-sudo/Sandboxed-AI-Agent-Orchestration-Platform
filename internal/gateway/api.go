@@ -275,6 +275,13 @@ func (h *Handler) terminateVM(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errBody("missing id"))
 		return
 	}
+	// Ownership: an operator may only terminate their own sandbox (admins/service
+	// pass; dev-mode without the data layer is unrestricted).
+	if h.db != nil {
+		if _, ok := h.authorizeSandbox(w, r, id); !ok {
+			return
+		}
+	}
 	if err := h.sup.Terminate(id); err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			writeJSON(w, http.StatusNotFound, errBody("sandbox not found"))
@@ -364,6 +371,13 @@ func (h *Handler) terminal(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		writeJSON(w, http.StatusNotFound, errBody("sandbox not found"))
 		return
+	}
+	// Ownership: an operator may only attach to their own sandbox's shell
+	// (admins/service pass; dev-mode without the data layer is unrestricted).
+	if h.db != nil {
+		if _, ok := h.authorizeSandbox(w, r, sandboxID); !ok {
+			return
+		}
 	}
 
 	rateAllow := func(ctx context.Context, name string) (bool, error) {

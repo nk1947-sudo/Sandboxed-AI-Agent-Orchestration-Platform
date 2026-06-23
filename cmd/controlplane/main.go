@@ -14,11 +14,13 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -33,6 +35,9 @@ import (
 	"github.com/yourorg/sandbox-platform/internal/state"
 	"github.com/yourorg/sandbox-platform/internal/store/pg"
 )
+
+// processStart marks daemon start for the uptime metric.
+var processStart = time.Now()
 
 type appConfig struct {
 	orch orchestrator.Config
@@ -269,6 +274,19 @@ func buildMux(sup *orchestrator.Supervisor, api *gateway.Handler) http.Handler {
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"active":` + strconv.Itoa(sup.Count()) + "}\n"))
+	})
+
+	// Prometheus text-format metrics (no external dependency). Scrape-friendly;
+	// restrict exposure via nftables/nginx if the operational data is sensitive.
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		fmt.Fprintf(w, "# HELP sandbox_active Currently running sandboxes.\n# TYPE sandbox_active gauge\nsandbox_active %d\n", sup.Count())
+		fmt.Fprintf(w, "# HELP go_goroutines Number of goroutines.\n# TYPE go_goroutines gauge\ngo_goroutines %d\n", runtime.NumGoroutine())
+		fmt.Fprintf(w, "# HELP go_memstats_alloc_bytes Allocated heap bytes in use.\n# TYPE go_memstats_alloc_bytes gauge\ngo_memstats_alloc_bytes %d\n", ms.Alloc)
+		fmt.Fprintf(w, "# HELP go_memstats_sys_bytes Total bytes obtained from the OS.\n# TYPE go_memstats_sys_bytes gauge\ngo_memstats_sys_bytes %d\n", ms.Sys)
+		fmt.Fprintf(w, "# HELP process_uptime_seconds Seconds since the control plane started.\n# TYPE process_uptime_seconds gauge\nprocess_uptime_seconds %.0f\n", time.Since(processStart).Seconds())
 	})
 
 	// Phase 4: REST + WebSocket.

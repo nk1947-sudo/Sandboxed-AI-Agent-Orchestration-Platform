@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: ["main", "develop"]
+    branches: ["main", "develop", "dev"]
   pull_request:
-    branches: ["main"]
+    branches: ["main", "dev"]
   # Nightly run at 02:00 UTC for the adversarial suite on the KVM runner.
   schedule:
     - cron: "0 2 * * *"
