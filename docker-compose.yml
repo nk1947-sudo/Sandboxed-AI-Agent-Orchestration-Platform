@@ -1,0 +1,39 @@
+# docker-compose.yml — backing services (PostgreSQL + Redis) for the control plane.
+#
+# The control plane itself runs ON THE HOST (it needs /dev/kvm, the jailer, and
+# cgroup v2 access), not in a container. These services back it:
+#
+#   docker compose up -d
+#   set -a && source .env && set +a && sudo -E ./controlplane
+#
+# Credentials come from .env (POSTGRES_* mirror PG_* used by the control plane).
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PG_USER:-postgres}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-Admin@123}
+      POSTGRES_DB: ${PG_DB:-sandbox}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-postgres} -d ${PG_DB:-sandbox}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redisdata:/data
+
+volumes:
+  pgdata:
+  redisdata:

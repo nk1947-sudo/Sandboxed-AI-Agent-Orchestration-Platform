@@ -12,7 +12,6 @@ package gateway
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -20,14 +19,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yourorg/sandbox-platform/internal/auth"
 	"github.com/yourorg/sandbox-platform/internal/hitl"
 	"github.com/yourorg/sandbox-platform/internal/orchestrator"
 	"github.com/yourorg/sandbox-platform/internal/state"
+	"github.com/yourorg/sandbox-platform/internal/store/pg"
 )
 
 // HandlerConfig holds operator-configurable knobs for the HTTP/WS surface.
 type HandlerConfig struct {
-	// Token is the API bearer token. Empty disables authentication (dev mode).
+	// Token is the API/service bearer token for CLI and automation. Empty
+	// disables token auth; combined with no DB sessions it opens dev mode.
 	Token string
 	// Origins is the WebSocket CORS allowlist. Empty permits same-host only.
 	Origins []string
@@ -37,6 +39,8 @@ type HandlerConfig struct {
 	// Defaults: 60 capacity, 1.0 token/s.
 	RateCapacity float64
 	RateRefill   float64
+	// CookieSecure sets the Secure flag on the session cookie (true in prod/HTTPS).
+	CookieSecure bool
 }
 
 func (c *HandlerConfig) applyDefaults() {
@@ -48,35 +52,55 @@ func (c *HandlerConfig) applyDefaults() {
 	}
 }
 
-// Handler bundles all Phase-4 HTTP handlers. It is constructed once and
-// registered on the control-plane mux; it is safe for concurrent use.
-type Handler struct {
-	sup   *orchestrator.Supervisor
-	store *state.Store
-	proxy *terminalProxy
-	log   *slog.Logger
-	cfg   HandlerConfig
+// Deps are the runtime dependencies wired into a Handler. DB, Sessions and
+// Snapshots are optional: when nil, user accounts / persistent history /
+// resume are disabled and the gateway falls back to token-or-open auth.
+type Deps struct {
+	Supervisor *orchestrator.Supervisor
+	State      *state.Store
+	Gate       *hitl.Gate
+	DB         *pg.Store
+	Sessions   *auth.Sessions
+	Snapshots  *orchestrator.SnapshotEngine
+	Log        *slog.Logger
 }
 
-// NewHandler wires the orchestrator, state store, HITL gate, and config
-// into a Handler ready to register on an http.ServeMux.
-func NewHandler(
-	sup *orchestrator.Supervisor,
-	store *state.Store,
-	gate *hitl.Gate,
-	log *slog.Logger,
-	cfg HandlerConfig,
-) *Handler {
+// Handler bundles all HTTP/WebSocket handlers. It is constructed once and
+// registered on the control-plane mux; it is safe for concurrent use.
+type Handler struct {
+	sup      *orchestrator.Supervisor
+	store    *state.Store
+	db       *pg.Store
+	sessions *auth.Sessions
+	snap     *orchestrator.SnapshotEngine
+	proxy    *terminalProxy
+	log      *slog.Logger
+	cfg      HandlerConfig
+}
+
+// NewHandler wires dependencies and config into a Handler ready to register on
+// an http.ServeMux.
+func NewHandler(d Deps, cfg HandlerConfig) *Handler {
 	cfg.applyDefaults()
+	log := d.Log
 	if log == nil {
 		log = slog.Default()
 	}
+	var transcripts *pg.TranscriptRepo
+	var sandboxes *pg.SandboxRepo
+	if d.DB != nil {
+		transcripts = d.DB.Transcripts
+		sandboxes = d.DB.Sandboxes
+	}
 	return &Handler{
-		sup:   sup,
-		store: store,
-		proxy: newTerminalProxy(gate, cfg.VsockConfig, cfg.Origins, log),
-		log:   log,
-		cfg:   cfg,
+		sup:      d.Supervisor,
+		store:    d.State,
+		db:       d.DB,
+		sessions: d.Sessions,
+		snap:     d.Snapshots,
+		proxy:    newTerminalProxy(d.Gate, cfg.VsockConfig, cfg.Origins, log, transcripts, sandboxes),
+		log:      log,
+		cfg:      cfg,
 	}
 }
 
@@ -85,9 +109,24 @@ func NewHandler(
 func (h *Handler) Register(mux *http.ServeMux) {
 	auth := h.requireAuth
 
+	// Auth: login is public (rate-limited inside); the rest require a session.
+	mux.HandleFunc("POST /api/login", h.login)
+	mux.HandleFunc("POST /api/logout", auth(h.logout))
+	mux.HandleFunc("GET /api/me", auth(h.me))
+	mux.HandleFunc("GET /api/users", auth(h.listUsers))
+	mux.HandleFunc("POST /api/users", auth(h.createUser))
+
 	mux.HandleFunc("GET /api/vms", auth(h.listVMs))
 	mux.HandleFunc("POST /api/vms", auth(h.launchVM))
 	mux.HandleFunc("DELETE /api/vms/{id}", auth(h.terminateVM))
+
+	// Durable sandbox history + resume (Postgres-backed).
+	mux.HandleFunc("GET /api/sandboxes", auth(h.listSandboxes))
+	mux.HandleFunc("POST /api/sandboxes/{id}/stop", auth(h.stopSandbox))
+	mux.HandleFunc("POST /api/sandboxes/{id}/resume", auth(h.resumeSandbox))
+	mux.HandleFunc("PATCH /api/sandboxes/{id}", auth(h.renameSandbox))
+	mux.HandleFunc("DELETE /api/sandboxes/{id}", auth(h.deleteSandbox))
+	mux.HandleFunc("GET /api/sandboxes/{id}/transcript", auth(h.getTranscript))
 
 	mux.HandleFunc("GET /api/approvals", auth(h.listApprovals))
 	mux.HandleFunc("POST /api/approvals/{id}", auth(h.decideApproval))
@@ -98,25 +137,41 @@ func (h *Handler) Register(mux *http.ServeMux) {
 
 // ── auth ───────────────────────────────────────────────────────────────────
 
+// requireAuth authenticates a request via, in order: (1) the session cookie
+// (browser); (2) the bearer/query API token (CLI, automation, non-browser WS);
+// (3) dev-open mode when neither a token nor DB sessions are configured. The
+// resolved principal is attached to the request context for ownership + audit.
 func (h *Handler) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if h.cfg.Token == "" {
+		// 1. Cookie session (browser; also carries WS handshake auth).
+		if h.sessions != nil {
+			if sid := auth.CookieValue(r); sid != "" {
+				if u, err := h.sessions.Resolve(r.Context(), sid); err == nil {
+					p := auth.Principal{UserID: u.ID, Username: u.Username, Role: u.Role}
+					next(w, r.WithContext(auth.WithPrincipal(r.Context(), p)))
+					return
+				}
+			}
+		}
+		// 2. Bearer header or ?token= query param (browsers can't set headers on
+		// a WS handshake). Constant-time compare to avoid a token timing oracle.
+		if h.cfg.Token != "" {
+			tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+			if tok == "" {
+				tok = r.URL.Query().Get("token")
+			}
+			if tok != "" && auth.ConstantTimeEqual(tok, h.cfg.Token) {
+				p := auth.Principal{Username: "service", Role: pg.RoleAdmin, Service: true}
+				next(w, r.WithContext(auth.WithPrincipal(r.Context(), p)))
+				return
+			}
+		}
+		// 3. Dev-open mode: no token AND no session backend configured.
+		if h.cfg.Token == "" && h.sessions == nil {
 			next(w, r)
 			return
 		}
-		// Browsers cannot set the Authorization header on a WebSocket handshake,
-		// so the /terminal endpoint authenticates via a ?token= query param.
-		// Prefer the header; fall back to the query param. Both are compared in
-		// constant time to avoid a timing oracle on the token.
-		tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if tok == "" {
-			tok = r.URL.Query().Get("token")
-		}
-		if subtle.ConstantTimeCompare([]byte(tok), []byte(h.cfg.Token)) != 1 {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-			return
-		}
-		next(w, r)
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 	}
 }
 
@@ -190,6 +245,23 @@ func (h *Handler) launchVM(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, errBody("launch failed"))
 		return
 	}
+	// Record durable history (owned by the caller).
+	if h.db != nil {
+		p, _ := auth.FromContext(r.Context())
+		if err := h.db.Sandboxes.Upsert(r.Context(), pg.Sandbox{
+			ID:         inst.ID,
+			OwnerID:    p.UserID,
+			Status:     pg.SandboxRunning,
+			VCPUs:      int(inst.Spec.VCPUs),
+			MemMiB:     int(inst.Spec.MemMiB),
+			CPUPercent: inst.Spec.CPUPercent,
+			PidsMax:    int(inst.Spec.PidsMax),
+			CID:        int64(inst.CID),
+		}); err != nil {
+			h.log.Warn("persist sandbox", "id", inst.ID, "err", err)
+		}
+		h.audit(r, p.UserID, "sandbox.launch", inst.ID, nil)
+	}
 	writeJSON(w, http.StatusCreated, instanceToView(inst))
 }
 
@@ -211,6 +283,10 @@ func (h *Handler) terminateVM(w http.ResponseWriter, r *http.Request) {
 		h.log.Error("terminate vm", "id", id, "err", err)
 		writeJSON(w, http.StatusInternalServerError, errBody("terminate failed"))
 		return
+	}
+	// Reflect the hard kill in durable history (no snapshot → not resumable).
+	if h.db != nil {
+		_ = h.db.Sandboxes.MarkStopped(r.Context(), id)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -241,16 +317,10 @@ func (h *Handler) decideApproval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Identify the operator from the bearer token (or "anonymous" in dev mode).
+	// Attribute the decision to the authenticated principal.
 	decidedBy := "anonymous"
-	if h.cfg.Token != "" {
-		if tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "); tok != "" {
-			n := 8
-			if len(tok) < n {
-				n = len(tok)
-			}
-			decidedBy = "token:" + tok[:n] + "…"
-		}
+	if p, ok := auth.FromContext(r.Context()); ok && p.Username != "" {
+		decidedBy = p.Username
 	}
 
 	var req decideRequest

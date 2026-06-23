@@ -4,7 +4,7 @@ import Metrics from "./components/Metrics";
 import Terminal from "./components/Terminal";
 import ApprovalWall from "./components/ApprovalWall";
 import { ToastContainer } from "./components/Toast";
-import { clearToken } from "./lib/auth";
+import { logout, currentUser } from "./lib/auth";
 
 interface Props {
   onLogout: () => void;
@@ -16,6 +16,7 @@ let _toastSeq = 0;
 export default function Dashboard({ onLogout }: Props) {
   const [selectedSandbox, setSelectedSandbox] = useState<string | null>(null);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
+  const user = currentUser();
 
   const pushError = useCallback((msg: string) => {
     const id = ++_toastSeq;
@@ -27,8 +28,7 @@ export default function Dashboard({ onLogout }: Props) {
   }, []);
 
   const handleLogout = () => {
-    clearToken();
-    onLogout();
+    void logout().finally(onLogout);
   };
 
   const handleSelect = (id: string) => {
@@ -45,6 +45,16 @@ export default function Dashboard({ onLogout }: Props) {
         </span>
         <span className="ml-2 h-2 w-2 rounded-full bg-green-400 shadow-[0_0_6px_#4ade80]" aria-label="online" />
         <div className="flex-1" />
+        {user && (
+          <span className="text-xs text-gray-400 mr-3">
+            {user.username}
+            {user.role === "admin" && (
+              <span className="ml-1.5 px-1.5 py-0.5 rounded bg-blue-600/20 text-blue-300 text-[10px] uppercase tracking-wide">
+                admin
+              </span>
+            )}
+          </span>
+        )}
         <button
           onClick={handleLogout}
           className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-gray-200 transition-colors"

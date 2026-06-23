@@ -1,19 +1,45 @@
-// Token is stored in module-level memory only — never written to localStorage,
-// sessionStorage, or cookies — to reduce XSS blast radius.
-let _token = "";
+// Auth state. There is NO token in browser memory or storage — the session
+// lives in an HttpOnly cookie the browser sends automatically. We only cache the
+// current user object (id/username/role) so the UI can render it; a page refresh
+// re-derives it from the server via restoreSession().
+import {
+  me as apiMe,
+  login as apiLogin,
+  logout as apiLogout,
+  User,
+} from "./api";
 
-export function getToken(): string {
-  return _token;
-}
+let _user: User | null = null;
 
-export function setToken(t: string): void {
-  _token = t;
-}
-
-export function clearToken(): void {
-  _token = "";
+export function currentUser(): User | null {
+  return _user;
 }
 
 export function isAuthenticated(): boolean {
-  return _token.length > 0;
+  return _user !== null;
+}
+
+// restoreSession asks the server who we are using the session cookie. Returns
+// the user when a valid session exists (survives page refresh), else null.
+export async function restoreSession(): Promise<User | null> {
+  try {
+    _user = await apiMe();
+  } catch {
+    _user = null;
+  }
+  return _user;
+}
+
+export async function login(username: string, password: string): Promise<User> {
+  const u = await apiLogin(username, password);
+  _user = u;
+  return u;
+}
+
+export async function logout(): Promise<void> {
+  try {
+    await apiLogout();
+  } finally {
+    _user = null;
+  }
 }

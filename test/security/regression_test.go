@@ -209,7 +209,7 @@ func newGatewayHandler(t *testing.T, token string) (*gateway.Handler, *http.Serv
 	t.Cleanup(func() { _ = rdb.Close() })
 	st := state.NewWithClient(rdb)
 	g := hitl.New(rdb, hitl.Config{ApproveTTL: time.Minute})
-	h := gateway.NewHandler(nil, st, g, nil, gateway.HandlerConfig{Token: token})
+	h := gateway.NewHandler(gateway.Deps{State: st, Gate: g}, gateway.HandlerConfig{Token: token})
 	mux := http.NewServeMux()
 	h.Register(mux)
 	return h, mux

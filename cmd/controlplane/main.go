@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -25,10 +26,12 @@ import (
 
 	"github.com/redis/go-redis/v9"
 
+	"github.com/yourorg/sandbox-platform/internal/auth"
 	"github.com/yourorg/sandbox-platform/internal/gateway"
 	"github.com/yourorg/sandbox-platform/internal/hitl"
 	"github.com/yourorg/sandbox-platform/internal/orchestrator"
 	"github.com/yourorg/sandbox-platform/internal/state"
+	"github.com/yourorg/sandbox-platform/internal/store/pg"
 )
 
 type appConfig struct {
@@ -48,6 +51,15 @@ type appConfig struct {
 	allowedOrigins []string // parsed from ALLOWED_ORIGINS (comma-separated)
 	hitlTTL        time.Duration
 	vsockRetryMax  int
+
+	// Enterprise data layer (optional — empty PG_HOST disables accounts,
+	// history, resume, and transcripts).
+	pgCfg                   pg.Config
+	sessionTTL              time.Duration
+	cookieSecure            bool
+	adminUser               string
+	adminPassword           string
+	transcriptRetentionDays int
 }
 
 func main() {
@@ -74,6 +86,42 @@ func main() {
 	store := state.NewWithClient(rdb)
 	gate := hitl.New(rdb, hitl.Config{ApproveTTL: cfg.hitlTTL})
 
+	// Optional Postgres data layer: user accounts, login sessions, sandbox
+	// history, snapshots, and transcripts. Empty PG_HOST runs without it.
+	var (
+		db         *pg.Store
+		sessions   *auth.Sessions
+		snapEngine *orchestrator.SnapshotEngine
+	)
+	if cfg.pgCfg.Host != "" {
+		pgStore, err := pg.New(ctx, cfg.pgCfg)
+		if err != nil {
+			log.Error("postgres connect", "err", err)
+			os.Exit(1)
+		}
+		db = pgStore
+		defer db.Close()
+		if err := db.Migrate(ctx); err != nil {
+			log.Error("postgres migrate", "err", err)
+			os.Exit(1)
+		}
+		if err := bootstrapAdmin(ctx, db, cfg.adminUser, cfg.adminPassword, log); err != nil {
+			log.Error("bootstrap admin", "err", err)
+			os.Exit(1)
+		}
+		sessions = auth.NewSessions(db.Sessions, cfg.sessionTTL)
+		eng, err := orchestrator.NewSnapshotEngine(filepath.Join(cfg.orch.StateDir, "snapshots"))
+		if err != nil {
+			log.Error("snapshot engine", "err", err)
+			os.Exit(1)
+		}
+		snapEngine = eng
+		go maintenanceLoop(ctx, log, db, cfg.transcriptRetentionDays)
+		log.Info("postgres data layer enabled", "db", cfg.pgCfg.DB)
+	} else {
+		log.Warn("PG_HOST not set — accounts, history, resume and transcripts disabled")
+	}
+
 	sup, err := orchestrator.NewSupervisor(cfg.orch,
 		orchestrator.WithLogger(log),
 		orchestrator.WithRecorder(store),
@@ -91,10 +139,19 @@ func main() {
 
 	go healthLoop(ctx, log, sup, store, cfg.heartbeatTTL, cfg.healthInterval)
 
-	apiHandler := gateway.NewHandler(sup, store, gate, log, gateway.HandlerConfig{
-		Token:       cfg.apiToken,
-		Origins:     cfg.allowedOrigins,
-		VsockConfig: gateway.Config{RetryMax: cfg.vsockRetryMax},
+	apiHandler := gateway.NewHandler(gateway.Deps{
+		Supervisor: sup,
+		State:      store,
+		Gate:       gate,
+		DB:         db,
+		Sessions:   sessions,
+		Snapshots:  snapEngine,
+		Log:        log,
+	}, gateway.HandlerConfig{
+		Token:        cfg.apiToken,
+		Origins:      cfg.allowedOrigins,
+		VsockConfig:  gateway.Config{RetryMax: cfg.vsockRetryMax},
+		CookieSecure: cfg.cookieSecure,
 	})
 
 	srv := &http.Server{
@@ -143,6 +200,57 @@ func healthLoop(ctx context.Context, log *slog.Logger, sup *orchestrator.Supervi
 			for _, inst := range sup.List() {
 				if err := store.Heartbeat(ctx, inst.ID, ttl); err != nil {
 					log.Warn("heartbeat", "id", inst.ID, "err", err)
+				}
+			}
+		}
+	}
+}
+
+// bootstrapAdmin creates the first admin account from ADMIN_USER/ADMIN_PASSWORD
+// when the users table is empty. It is a no-op once any user exists.
+func bootstrapAdmin(ctx context.Context, db *pg.Store, user, pass string, log *slog.Logger) error {
+	n, err := db.Users.Count(ctx)
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	if user == "" || pass == "" {
+		log.Warn("no users exist and ADMIN_USER/ADMIN_PASSWORD are unset — create an admin before logging in")
+		return nil
+	}
+	hash, err := auth.HashPassword(pass)
+	if err != nil {
+		return err
+	}
+	if _, err := db.Users.Create(ctx, user, hash, pg.RoleAdmin); err != nil {
+		return err
+	}
+	log.Info("bootstrapped admin user", "username", user)
+	return nil
+}
+
+// maintenanceLoop periodically purges expired sessions and prunes old
+// transcript lines.
+func maintenanceLoop(ctx context.Context, log *slog.Logger, db *pg.Store, retentionDays int) {
+	t := time.NewTicker(15 * time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if n, err := db.Sessions.DeleteExpired(ctx); err != nil {
+				log.Warn("session gc", "err", err)
+			} else if n > 0 {
+				log.Info("expired sessions purged", "count", n)
+			}
+			if retentionDays > 0 {
+				if n, err := db.Transcripts.PruneOlderThanDays(ctx, retentionDays); err != nil {
+					log.Warn("transcript prune", "err", err)
+				} else if n > 0 {
+					log.Info("old transcript lines pruned", "count", n)
 				}
 			}
 		}
@@ -205,6 +313,20 @@ func loadConfig() appConfig {
 		allowedOrigins:        origins,
 		hitlTTL:               time.Duration(envInt("HITL_TTL_SEC", 3600)) * time.Second,
 		vsockRetryMax:         envInt("VSOCK_RETRY_MAX", 10),
+
+		pgCfg: pg.Config{
+			Host:     envStr("PG_HOST", ""),
+			Port:     envStr("PG_PORT", "5432"),
+			User:     envStr("PG_USER", "postgres"),
+			Password: envStr("PG_PASSWORD", ""),
+			DB:       envStr("PG_DB", "sandbox"),
+			SSLMode:  envStr("PG_SSLMODE", "disable"),
+		},
+		sessionTTL:              time.Duration(envInt("SESSION_TTL_HOURS", 24)) * time.Hour,
+		cookieSecure:            envBool("COOKIE_SECURE", false),
+		adminUser:               envStr("ADMIN_USER", ""),
+		adminPassword:           envStr("ADMIN_PASSWORD", ""),
+		transcriptRetentionDays: envInt("TRANSCRIPT_RETENTION_DAYS", 30),
 	}
 }
 

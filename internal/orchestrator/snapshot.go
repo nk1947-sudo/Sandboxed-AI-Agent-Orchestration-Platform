@@ -37,10 +37,11 @@ import (
 
 // ── Snapshot types ─────────────────────────────────────────────────────────
 
-// SnapshotPaths holds the host-absolute paths for the two snapshot artefacts.
+// SnapshotPaths holds the host-absolute paths for the snapshot artefacts.
 type SnapshotPaths struct {
 	MemFile   string // memory image (guest RAM pages)
 	StateFile string // VM state (CPU registers, device state)
+	DiskFile  string // retained per-VM rootfs disk, consistent with MemFile
 }
 
 // Snapshot represents one captured VM state on disk.
@@ -111,6 +112,70 @@ func (e *SnapshotEngine) Create(ctx context.Context, inst *Instance) (Snapshot, 
 // Delete removes the snapshot files from disk.
 func (e *SnapshotEngine) Delete(snap Snapshot) error {
 	return os.RemoveAll(filepath.Dir(snap.Paths.MemFile))
+}
+
+// CreatePausedWithDisk pauses inst, captures the memory + device-state snapshot,
+// and copies the live per-VM disk (diskPath) into the snapshot directory while
+// the guest is still paused — so the disk image is byte-consistent with the
+// memory image. The VM is LEFT PAUSED; the caller tears it down. This is the
+// stop-with-snapshot path used to make a sandbox resumable to its exact state.
+// On any failure the partial snapshot directory is removed.
+func (e *SnapshotEngine) CreatePausedWithDisk(ctx context.Context, inst *Instance, diskPath string) (Snapshot, error) {
+	id := "snap-" + randHex(6)
+	dir := filepath.Join(e.snapshotDir, id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return Snapshot{}, fmt.Errorf("snapshot: mkdir: %w", err)
+	}
+	memFile := filepath.Join(dir, "mem.img")
+	stateFile := filepath.Join(dir, "state.img")
+	diskFile := filepath.Join(dir, "disk.img")
+
+	if err := inst.machine.PauseVM(ctx); err != nil {
+		_ = os.RemoveAll(dir)
+		return Snapshot{}, fmt.Errorf("snapshot: pause: %w", err)
+	}
+	if err := inst.machine.CreateSnapshot(ctx, memFile, stateFile); err != nil {
+		_ = os.RemoveAll(dir)
+		return Snapshot{}, fmt.Errorf("snapshot: create: %w", err)
+	}
+	// Copy the disk while still paused so it matches the memory image exactly.
+	if err := copyFile(diskPath, diskFile, 0o660); err != nil {
+		_ = os.RemoveAll(dir)
+		return Snapshot{}, fmt.Errorf("snapshot: retain disk: %w", err)
+	}
+
+	return Snapshot{
+		ID:          id,
+		SandboxID:   inst.ID,
+		Paths:       SnapshotPaths{MemFile: memFile, StateFile: stateFile, DiskFile: diskFile},
+		CreatedAt:   time.Now(),
+		GuestMemMiB: inst.Spec.MemMiB,
+		GuestVCPUs:  inst.Spec.VCPUs,
+	}, nil
+}
+
+// StopWithSnapshot snapshots a running sandbox (memory + device state + a
+// consistent copy of its disk) and then tears the live VM down. The returned
+// Snapshot can later be passed to LoadSnapshot to resume the guest to its exact
+// prior state. The per-VM disk is read from the standard launch location
+// (StateDir/<id>/rootfs.ext4).
+func (s *Supervisor) StopWithSnapshot(ctx context.Context, engine *SnapshotEngine, id string) (Snapshot, error) {
+	s.mu.Lock()
+	inst, ok := s.inst[id]
+	s.mu.Unlock()
+	if !ok {
+		return Snapshot{}, fmt.Errorf("orchestrator: sandbox %q not found", id)
+	}
+	diskPath := filepath.Join(s.cfg.StateDir, id, "rootfs.ext4")
+	snap, err := engine.CreatePausedWithDisk(ctx, inst, diskPath)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	// The VM is paused with a consistent snapshot; reclaim all host state.
+	if err := s.Terminate(id); err != nil {
+		s.log.Warn("terminate after snapshot", "id", id, "err", err)
+	}
+	return snap, nil
 }
 
 // ── Overlayfs rootfs helpers ───────────────────────────────────────────────
@@ -187,10 +252,19 @@ func newRestoredIdentity(vsockPath string, cid uint32) (RestoredIdentity, error)
 //  5. Re-keys: assigns fresh CID, vsock UDS path, and entropy seed.
 func (s *Supervisor) LoadSnapshot(ctx context.Context, snap Snapshot, spec LaunchSpec) (*Instance, error) {
 	spec = applySpecDefaults(spec)
-	id := "sb-" + randHex(6)
-	spec.ID = id
+	// Reuse the caller-provided id (resume keeps the original sandbox id); a
+	// random one is generated when empty.
+	id := spec.ID
+	if id == "" {
+		id = "sb-" + randHex(6)
+		spec.ID = id
+	}
 
 	s.mu.Lock()
+	if _, dup := s.inst[id]; dup {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("orchestrator: sandbox %q already exists", id)
+	}
 	if err := s.admitLocked(spec); err != nil {
 		s.mu.Unlock()
 		return nil, err
@@ -225,18 +299,32 @@ func (s *Supervisor) LoadSnapshot(ctx context.Context, snap Snapshot, spec Launc
 		paths.HostVsock = vsockPath
 	}
 
-	// Per-VM CoW overlayfs — no full rootfs copy.
-	overlay, err := MountOverlay(s.cfg.StateDir, id, s.cfg.RootfsPath)
-	if err != nil {
+	// Restore the disk to its exact snapshot-time state: copy the retained
+	// snapshot disk into a fresh per-VM file so the resumed VM is independent
+	// and the snapshot stays reusable. Chmod defeats the umask and the gid is
+	// set to the jailer's so the demoted VMM can open the drive O_RDWR — the
+	// same fix the Launch path uses. (overlayfs cannot CoW a block image; the
+	// retained full copy is the correct mechanism.)
+	rootfsCopy := filepath.Join(stateDir, "rootfs.ext4")
+	if err := copyFile(snap.Paths.DiskFile, rootfsCopy, 0o660); err != nil {
 		s.cids.free(cid)
 		_ = os.RemoveAll(stateDir)
-		return nil, fmt.Errorf("snapshot restore: overlay: %w", err)
+		return nil, fmt.Errorf("snapshot restore: copy disk: %w", err)
+	}
+	if err := os.Chmod(rootfsCopy, 0o660); err != nil {
+		s.cids.free(cid)
+		_ = os.RemoveAll(stateDir)
+		return nil, fmt.Errorf("snapshot restore: chmod disk: %w", err)
+	}
+	if err := os.Chown(rootfsCopy, 0, s.cfg.JailerGID); err != nil {
+		s.cids.free(cid)
+		_ = os.RemoveAll(stateDir)
+		return nil, fmt.Errorf("snapshot restore: chown disk: %w", err)
 	}
 
 	leaf, err := s.prepareCgroup(id, spec)
 	if err != nil {
 		s.cids.free(cid)
-		_ = UnmountOverlay(overlay)
 		_ = os.RemoveAll(stateDir)
 		return nil, fmt.Errorf("snapshot restore: cgroup: %w", err)
 	}
@@ -246,7 +334,6 @@ func (s *Supervisor) LoadSnapshot(ctx context.Context, snap Snapshot, spec Launc
 		cancel()
 		s.cids.free(cid)
 		_ = os.Remove(leaf)
-		_ = UnmountOverlay(overlay)
 		_ = os.RemoveAll(stateDir)
 		if paths.ChrootRoot != "" {
 			_ = os.RemoveAll(filepath.Dir(paths.ChrootRoot))
@@ -264,7 +351,7 @@ func (s *Supervisor) LoadSnapshot(ctx context.Context, snap Snapshot, spec Launc
 		},
 		Drives: []models.Drive{{
 			DriveID:      firecracker.String("rootfs"),
-			PathOnHost:   firecracker.String(overlay.MergedDir),
+			PathOnHost:   firecracker.String(rootfsCopy),
 			IsRootDevice: firecracker.Bool(true),
 			IsReadOnly:   firecracker.Bool(false),
 		}},

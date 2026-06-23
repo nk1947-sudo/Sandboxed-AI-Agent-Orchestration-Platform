@@ -481,3 +481,76 @@ quickstart `vmlinux.bin` (Step 2) and verify it's ~21 MB.
 | HITL classify/hold/approve/reject | ✅ full lifecycle |
 | none-networking egress block | ✅ apk can't reach mirrors |
 | Unprivileged in-guest exec (uid 1000) | ✅ apk denied root |
+
+---
+
+## Enterprise data layer — accounts, persistent login, history + resume, transcripts
+
+This adds PostgreSQL-backed user accounts (so a page refresh stays logged in),
+durable sandbox **history**, true **resume** (exact memory + disk state), and saved
+terminal **transcripts**. It is optional: leave `PG_HOST` empty to run without it.
+
+### 1. Start Postgres + Redis
+
+```bash
+cd "/mnt/c/Users/<you>/Desktop/.../Sandboxed AI Agent Orchestration Platform"
+cp .env.example .env        # then edit values (PG_PASSWORD, ADMIN_USER/PASSWORD, ...)
+docker compose up -d        # postgres:16 + redis:7 on 127.0.0.1
+docker compose ps           # both healthy
+```
+
+`docker compose` creates the `sandbox` database automatically; the control plane
+runs its own **migrations** on startup (no manual SQL needed). The first
+`ADMIN_USER`/`ADMIN_PASSWORD` becomes an admin account on first boot.
+
+### 2. Resolve the new Go dependencies and rebuild
+
+The data layer pulls in `pgx` and `golang.org/x/crypto`. Populate them once:
+
+```bash
+go mod tidy        # downloads pgx/v5 + x/crypto, updates go.sum
+go build -o controlplane ./cmd/controlplane/
+```
+
+### 3. Run with the data layer enabled
+
+```bash
+set -a && source .env && set +a
+sudo -E ./controlplane
+# log shows: "postgres data layer enabled" and "bootstrapped admin user"
+```
+
+### 4. Build the dashboard (Node 20) and log in
+
+```bash
+cd web && BACKEND_PORT=7777 npm run dev   # http://localhost:3000
+```
+
+- Sign in with `ADMIN_USER` / `ADMIN_PASSWORD`.
+- **Refresh the page → you stay logged in** (the session lives in an HttpOnly
+  cookie; `GET /api/me` restores it). No token is ever stored in the browser.
+- Click **New sandbox**, run commands, then **Stop** (snapshots it). It moves to
+  history as *stopped*; click **Resume** to restore it to its exact prior state
+  (a file you wrote and an in-RAM value both survive). Reopen it to see the
+  **replayed transcript**.
+
+### Verify state really resumed (not relaunched)
+
+```bash
+# In a sandbox terminal, before Stop:
+echo hello > /workspace/proof.txt; date +%s > /workspace/ts
+# Stop from the UI, then Resume, then:
+cat /workspace/proof.txt    # hello   (disk survived)
+```
+
+### Troubleshooting
+
+- **`postgres connect` error** — `docker compose ps`; ensure `PG_HOST=127.0.0.1`
+  and `PG_PORT=5432` match the compose mapping.
+- **Login returns 401 immediately** — the admin wasn't created (users table not
+  empty, or `ADMIN_USER/PASSWORD` unset on first boot). Create one via an admin:
+  `POST /api/users`, or drop the `users` table and restart with the env set.
+- **Resume fails "no snapshot to resume"** — the sandbox was hard-killed
+  (`DELETE /api/vms/{id}`) instead of **Stopped**; only Stop captures a snapshot.
+- **Cookie not set over plain HTTP** — keep `COOKIE_SECURE=false` for local dev;
+  set it `true` only behind HTTPS.

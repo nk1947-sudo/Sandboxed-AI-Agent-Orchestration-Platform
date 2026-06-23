@@ -255,6 +255,25 @@ Defaults: `KERNEL_IMAGE=/var/lib/sandbox/vmlinux-6.1`, `ROOTFS_IMAGE=/var/lib/sa
 | `HEALTH_INTERVAL_SEC` | Reaper / health-loop interval. | `5` |
 | `SHUTDOWN_TERMINATES_ALL` | Terminate all running VMs on graceful shutdown. | `true` |
 
+### PostgreSQL & Accounts (optional)
+
+Enables user accounts, persistent login sessions, durable sandbox history,
+true resume (memory + disk), and saved transcripts. Leave `PG_HOST` empty to run
+without it. See [DEPLOY_WSL2.md](DEPLOY_WSL2.md) for the full setup.
+
+| Variable | Description | Default |
+|---|---|---|
+| `PG_HOST` | Postgres host. **Empty disables the whole data layer.** | *(empty)* |
+| `PG_PORT` / `PG_USER` / `PG_PASSWORD` / `PG_DB` | Connection parameters. | `5432` / `postgres` / *(empty)* / `sandbox` |
+| `PG_SSLMODE` | `disable` (dev) … `verify-full` (prod). | `disable` |
+| `ADMIN_USER` / `ADMIN_PASSWORD` | First admin, created when the users table is empty. | *(empty)* |
+| `SESSION_TTL_HOURS` | Login session lifetime. | `24` |
+| `COOKIE_SECURE` | Set `true` behind HTTPS (Secure session cookie). | `false` |
+| `TRANSCRIPT_RETENTION_DAYS` | Days to keep terminal transcripts. | `30` |
+
+> The session cookie holds an opaque session id, **not** the API token — the
+> token is never written to browser storage.
+
 ---
 
 ## Production Deployment

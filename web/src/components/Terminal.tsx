@@ -9,6 +9,7 @@ import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { useTerminalSocket, WsFrame } from "../hooks/useTerminalSocket";
+import { getTranscript } from "../lib/api";
 import { Loader2, Wifi, WifiOff, AlertCircle } from "lucide-react";
 
 interface Props {
@@ -67,18 +68,58 @@ export default function Terminal({ sandboxId }: Props) {
     xtermRef.current = term;
     fitRef.current = fit;
 
-    if (sandboxId) {
-      term.writeln(`\x1b[1;34mConnecting to sandbox \x1b[1;37m${sandboxId}\x1b[0m…`);
-    } else {
-      term.writeln("\x1b[2mSelect a sandbox to start a session.\x1b[0m");
-    }
-
     return () => {
       term.dispose();
       xtermRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Replay the persisted transcript whenever the selected sandbox changes, then
+  // the live WebSocket stream appends below it (chat-like history).
+  useEffect(() => {
+    const term = xtermRef.current;
+    if (!term) return;
+    term.clear();
+    if (!sandboxId) {
+      term.writeln("\x1b[2mSelect a sandbox to start a session.\x1b[0m");
+      return;
+    }
+    let cancelled = false;
+    term.writeln(`\x1b[1;34mSandbox \x1b[1;37m${sandboxId}\x1b[0m`);
+    getTranscript(sandboxId)
+      .then((lines) => {
+        if (cancelled || !xtermRef.current) return;
+        if (lines.length === 0) return;
+        term.writeln("\x1b[2m── session history ──\x1b[0m");
+        for (const l of lines) {
+          switch (l.kind) {
+            case "input":
+              term.writeln(`\x1b[1;32m$ \x1b[0m${l.data ?? ""}`);
+              break;
+            case "output":
+              term.write(l.data ?? "");
+              if (!(l.data ?? "").endsWith("\n")) term.write("\r\n");
+              break;
+            case "exit":
+              term.writeln(`\x1b[2m[exit ${l.exit_code ?? 0}]\x1b[0m`);
+              break;
+            case "hitl":
+              term.writeln(`\x1b[33m[HITL] ${l.data ?? ""}\x1b[0m`);
+              break;
+            default:
+              if (l.data) term.writeln(`\x1b[2m${l.data}\x1b[0m`);
+          }
+        }
+        term.writeln("\x1b[2m── live ──\x1b[0m");
+      })
+      .catch(() => {
+        /* transcript unavailable (Postgres off) — ignore */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sandboxId]);
 
   // Resize observer.
   useEffect(() => {

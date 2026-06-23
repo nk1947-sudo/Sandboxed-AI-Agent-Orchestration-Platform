@@ -10,12 +10,15 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 
 	"github.com/yourorg/sandbox-platform/internal/hitl"
 	"github.com/yourorg/sandbox-platform/internal/protocol"
+	"github.com/yourorg/sandbox-platform/internal/store/pg"
 )
 
 // wsRequest is the JSON message a browser sends over the terminal WebSocket.
@@ -47,19 +50,23 @@ const (
 // terminalProxy is the WebSocket↔vsock bridge for the /terminal endpoint.
 // It is embedded inside Handler (api.go) and shares its fields.
 type terminalProxy struct {
-	gate     *hitl.Gate
-	vsockCfg Config
-	origins  []string
-	log      *slog.Logger
-	upgrader *websocket.Upgrader
+	gate        *hitl.Gate
+	vsockCfg    Config
+	origins     []string
+	log         *slog.Logger
+	upgrader    *websocket.Upgrader
+	transcripts *pg.TranscriptRepo // optional: persist the session transcript
+	sandboxes   *pg.SandboxRepo    // optional: touch last_used_at on open
 }
 
-func newTerminalProxy(gate *hitl.Gate, vsockCfg Config, origins []string, log *slog.Logger) *terminalProxy {
+func newTerminalProxy(gate *hitl.Gate, vsockCfg Config, origins []string, log *slog.Logger, transcripts *pg.TranscriptRepo, sandboxes *pg.SandboxRepo) *terminalProxy {
 	p := &terminalProxy{
-		gate:     gate,
-		vsockCfg: vsockCfg,
-		origins:  origins,
-		log:      log,
+		gate:        gate,
+		vsockCfg:    vsockCfg,
+		origins:     origins,
+		log:         log,
+		transcripts: transcripts,
+		sandboxes:   sandboxes,
 	}
 	p.upgrader = &websocket.Upgrader{
 		ReadBufferSize:  4096,
@@ -67,6 +74,20 @@ func newTerminalProxy(gate *hitl.Gate, vsockCfg Config, origins []string, log *s
 		CheckOrigin:     p.checkOrigin,
 	}
 	return p
+}
+
+// recordLine appends one transcript line best-effort, using a background
+// context so it persists even if the client has just disconnected. No-op when
+// no transcript repo is wired.
+func (p *terminalProxy) recordLine(sandboxID string, kind pg.TranscriptKind, data string, exitCode *int) {
+	if p.transcripts == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := p.transcripts.Append(ctx, sandboxID, kind, data, exitCode); err != nil {
+		p.log.Warn("transcript append failed", "sandbox", sandboxID, "err", err)
+	}
 }
 
 // checkOrigin validates the WebSocket Origin header against h.origins.
@@ -112,6 +133,13 @@ func (p *terminalProxy) serve(
 
 	p.log.Info("terminal session started", "sandbox", sandboxID)
 	defer p.log.Info("terminal session ended", "sandbox", sandboxID)
+
+	// Refresh history "last used" when a session opens.
+	if p.sandboxes != nil {
+		tctx, tcancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = p.sandboxes.Touch(tctx, sandboxID)
+		tcancel()
+	}
 
 	client := New(vsockPath, p.vsockCfg)
 
@@ -179,6 +207,9 @@ func (p *terminalProxy) serve(
 			}
 		}
 
+		// Persist the command the operator ran.
+		p.recordLine(sandboxID, pg.KindInput, req.Script, nil)
+
 		// Classify the script.
 		class, reason := p.gate.Classify(req.Script)
 		if class == hitl.ClassSensitive {
@@ -189,6 +220,7 @@ func (p *terminalProxy) serve(
 				continue
 			}
 			send(wsEvent{Kind: evtPending, ApprovalID: approvalID, Reason: reason})
+			p.recordLine(sandboxID, pg.KindHITL, "pending: "+reason, nil)
 
 			// Cancel the wait if the client disconnects, so we never execute an
 			// approved command for a session that has already gone away.
@@ -204,9 +236,11 @@ func (p *terminalProxy) serve(
 			}
 			if decision == hitl.StateRejected {
 				send(wsEvent{Kind: evtRejected})
+				p.recordLine(sandboxID, pg.KindHITL, "rejected", nil)
 				continue
 			}
 			send(wsEvent{Kind: evtApproved})
+			p.recordLine(sandboxID, pg.KindHITL, "approved", nil)
 		}
 
 		// Execute — benign or newly approved.
@@ -218,16 +252,28 @@ func (p *terminalProxy) serve(
 			Env:        req.Env,
 		}
 
+		var outBuf strings.Builder
+		var exitCode *int
 		execCtx, cancelExec := ctxUntilDone(r.Context(), done)
 		execErr := client.Exec(execCtx, execReq, func(f protocol.ResponseFrame) {
 			switch f.Kind {
 			case protocol.FrameOutput:
+				outBuf.WriteString(f.Data)
 				send(wsEvent{Kind: evtOutput, Data: f.Data})
 			case protocol.FrameExit:
+				code := f.ExitCode
+				exitCode = &code
 				send(wsEvent{Kind: evtExit, ExitCode: f.ExitCode})
 			}
 		})
 		cancelExec()
+		// Persist the coalesced output + exit for transcript replay.
+		if outBuf.Len() > 0 {
+			p.recordLine(sandboxID, pg.KindOutput, outBuf.String(), nil)
+		}
+		if exitCode != nil {
+			p.recordLine(sandboxID, pg.KindExit, "", exitCode)
+		}
 		if execErr != nil {
 			p.log.Warn("vsock exec error", "sandbox", sandboxID, "err", execErr)
 			send(wsEvent{Kind: evtError, Message: execErr.Error()})

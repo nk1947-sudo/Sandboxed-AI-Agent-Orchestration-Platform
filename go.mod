@@ -1,6 +1,6 @@
 module github.com/yourorg/sandbox-platform
 
-go 1.24
+go 1.25
 
 // Direct dependencies. Run `go mod tidy` on a Linux build host to populate the
 // indirect requirements and generate go.sum (the orchestrator and guest agent
@@ -12,7 +12,17 @@ require (
 
 require (
 	github.com/alicebob/miniredis/v2 v2.38.0
+	github.com/google/uuid v1.3.0
+	github.com/gorilla/websocket v1.5.3
 	github.com/redis/go-redis/v9 v9.20.1
+)
+
+// Enterprise data layer (Postgres) + password hashing. Run `go mod tidy` on the
+// Linux build host to populate go.sum and reclassify indirect requirements
+// (this also promotes github.com/google/uuid to a direct dependency).
+require (
+	github.com/jackc/pgx/v5 v5.7.1
+	golang.org/x/crypto v0.31.0
 )
 
 require (
@@ -34,10 +44,11 @@ require (
 	github.com/go-openapi/swag v0.21.1 // indirect
 	github.com/go-openapi/validate v0.22.0 // indirect
 	github.com/go-stack/stack v1.8.1 // indirect
-	github.com/google/uuid v1.3.0 // indirect
-	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/hashicorp/errwrap v1.0.0 // indirect
 	github.com/hashicorp/go-multierror v1.1.1 // indirect
+	github.com/jackc/pgpassfile v1.0.0 // indirect
+	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
 	github.com/mdlayher/socket v0.4.1 // indirect
@@ -45,15 +56,16 @@ require (
 	github.com/oklog/ulid v1.3.1 // indirect
 	github.com/opentracing/opentracing-go v1.2.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
+	github.com/rogpeppe/go-internal v1.15.0 // indirect
 	github.com/sirupsen/logrus v1.8.1 // indirect
 	github.com/vishvananda/netlink v1.1.1-0.20210330154013-f5de75959ad5 // indirect
 	github.com/vishvananda/netns v0.0.0-20210104183010-2eb08e3e575f // indirect
 	github.com/yuin/gopher-lua v1.1.1 // indirect
 	go.mongodb.org/mongo-driver v1.8.3 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
-	golang.org/x/net v0.9.0 // indirect
-	golang.org/x/sync v0.1.0 // indirect
+	golang.org/x/net v0.21.0 // indirect
+	golang.org/x/sync v0.10.0 // indirect
 	golang.org/x/sys v0.30.0 // indirect
-	golang.org/x/text v0.9.0 // indirect
+	golang.org/x/text v0.21.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )

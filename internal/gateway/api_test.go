@@ -37,7 +37,7 @@ func newTestDeps(t *testing.T, token string) testDeps {
 
 	st := state.NewWithClient(rdb)
 	g := hitl.New(rdb, hitl.Config{ApproveTTL: time.Minute})
-	h := gateway.NewHandler(nil, st, g, nil, gateway.HandlerConfig{Token: token})
+	h := gateway.NewHandler(gateway.Deps{State: st, Gate: g}, gateway.HandlerConfig{Token: token})
 	return testDeps{handler: h, gate: g, mr: mr}
 }
 
