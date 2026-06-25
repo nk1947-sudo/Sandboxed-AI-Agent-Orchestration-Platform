@@ -216,6 +216,7 @@ type launchRequest struct {
 	MemMiB     int64  `json:"mem_mib,omitempty"`
 	CPUPercent int    `json:"cpu_percent,omitempty"`
 	PidsMax    int64  `json:"pids_max,omitempty"`
+	Egress     bool   `json:"egress,omitempty"` // opt-in egress (needs EGRESS_ENABLED)
 }
 
 func (h *Handler) launchVM(w http.ResponseWriter, r *http.Request) {
@@ -234,6 +235,7 @@ func (h *Handler) launchVM(w http.ResponseWriter, r *http.Request) {
 		MemMiB:     req.MemMiB,
 		CPUPercent: req.CPUPercent,
 		PidsMax:    req.PidsMax,
+		Egress:     req.Egress,
 	}
 	inst, err := h.sup.Launch(r.Context(), spec)
 	if err != nil {

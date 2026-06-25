@@ -103,6 +103,17 @@ type Config struct {
 	// Admission control. 0 means unlimited.
 	MaxConcurrent   int   // max simultaneously running sandboxes
 	MemoryBudgetMiB int64 // total guest RAM the host will commit across all VMs
+
+	// Egress networking (opt-in, default off). When EgressEnabled is false every
+	// VM boots with none-networking (loopback only) — the secure default. When
+	// true, a VM launched with LaunchSpec.Egress gets a per-VM TAP on the sandbox
+	// bridge plus an ip= boot arg; the host nftables ruleset + Squid proxy
+	// (deploy/firewall, deploy/squid) enforce default-deny egress with a dstdomain
+	// allowlist and block IMDS. Requires the host bridge/nft/Squid to be set up.
+	EgressEnabled   bool
+	EgressGatewayIP string // host bridge / Squid IP (default 10.200.0.1)
+	EgressNetmask   string // guest netmask (default 255.255.255.0)
+	EgressTapScript string // path to scripts/vm-tap.sh
 }
 
 // LaunchSpec describes one sandbox to boot.
@@ -112,6 +123,7 @@ type LaunchSpec struct {
 	MemMiB     int64  // guest RAM in MiB (default 256)
 	CPUPercent int    // host CPU cap, percent of one core; 100 == one full core
 	PidsMax    int64  // max processes in the cgroup leaf (fork-bomb backstop)
+	Egress     bool   // request opt-in egress networking (needs Config.EgressEnabled)
 }
 
 // Instance is a booted, tracked sandbox.
@@ -123,12 +135,14 @@ type Instance struct {
 	SocketPath   string // firecracker API socket, host-absolute
 	VsockUDSPath string // host-absolute path the gateway dials (CONNECT 5005)
 	CgroupPath   string // cgroup v2 leaf for this VM
+	TapName      string // per-VM egress TAP device, or "" for none-networking
 	CreatedAt    time.Time
 	Spec         LaunchSpec
 
-	machine *firecracker.Machine
-	ctx     context.Context
-	cancel  context.CancelFunc
+	tapIndex uint32 // sandbox-subnet index backing TapName (for allocator free)
+	machine  *firecracker.Machine
+	ctx      context.Context
+	cancel   context.CancelFunc
 }
 
 func (i *Instance) toRecord() sandbox.Record {
@@ -160,6 +174,7 @@ type Supervisor struct {
 	mu   sync.Mutex
 	inst map[string]*Instance
 	cids *cidAllocator
+	taps *cidAllocator // sandbox-subnet index allocator for opt-in egress TAPs
 }
 
 // Option configures a Supervisor.
@@ -234,6 +249,7 @@ func NewSupervisor(cfg Config, opts ...Option) (*Supervisor, error) {
 		log:  slog.Default(),
 		inst: make(map[string]*Instance),
 		cids: newCIDAllocator(cfg.CIDMin, cfg.CIDMax),
+		taps: newCIDAllocator(egressTapIndexMin, egressTapIndexMax),
 	}
 	for _, o := range opts {
 		o(s)
@@ -281,6 +297,7 @@ func (s *Supervisor) Launch(ctx context.Context, spec LaunchSpec) (*Instance, er
 	leaf, err := s.prepareCgroup(id, spec)
 	if err != nil {
 		s.cids.free(cid)
+		s.teardownEgress(id, paths.TapName, paths.TapIndex)
 		_ = os.RemoveAll(filepath.Join(s.cfg.StateDir, id))
 		return nil, fmt.Errorf("orchestrator: prepare cgroup: %w", err)
 	}
@@ -291,6 +308,7 @@ func (s *Supervisor) Launch(ctx context.Context, spec LaunchSpec) (*Instance, er
 	cleanup := func() {
 		cancel()
 		s.cids.free(cid)
+		s.teardownEgress(id, paths.TapName, paths.TapIndex)
 		_ = os.Remove(leaf)
 		_ = os.RemoveAll(filepath.Join(s.cfg.StateDir, id))
 		if paths.ChrootRoot != "" {
@@ -335,8 +353,10 @@ func (s *Supervisor) Launch(ctx context.Context, spec LaunchSpec) (*Instance, er
 		SocketPath:   paths.HostSocket,
 		VsockUDSPath: paths.HostVsock,
 		CgroupPath:   leaf,
+		TapName:      paths.TapName,
 		CreatedAt:    time.Now(),
 		Spec:         spec,
+		tapIndex:     paths.TapIndex,
 		machine:      machine,
 		ctx:          vmCtx,
 		cancel:       cancel,
@@ -398,6 +418,7 @@ func (s *Supervisor) Terminate(id string) error {
 	}
 
 	s.cids.free(inst.CID)
+	s.teardownEgress(inst.ID, inst.TapName, inst.tapIndex)
 	if inst.CgroupPath != "" {
 		_ = os.Remove(inst.CgroupPath) // empty cgroup leaves are removable
 	}
@@ -504,6 +525,8 @@ type bootPaths struct {
 	HostVsock  string // gateway dials this and sends "CONNECT 5005\n"
 	HostSocket string // firecracker API socket
 	ChrootRoot string // jailer chroot root, or "" in dev mode
+	TapName    string // per-VM egress TAP device, or "" for none-networking
+	TapIndex   uint32 // sandbox-subnet index backing TapName
 }
 
 func (s *Supervisor) buildFirecrackerConfig(id string, cid uint32, spec LaunchSpec) (firecracker.Config, bootPaths, error) {
@@ -557,6 +580,22 @@ func (s *Supervisor) buildFirecrackerConfig(id string, cid uint32, spec LaunchSp
 		kernelArgs = DefaultKernelArgs
 	}
 
+	// Egress is opt-in and default-off. When disabled (the common, secure path)
+	// nets stays nil => "none" networking: loopback only, no host LAN access. When
+	// enabled, setupEgress provisions a per-VM TAP and an ip= boot arg; host
+	// nftables + Squid enforce the allowlist and block IMDS.
+	var nets []firecracker.NetworkInterface
+	if s.cfg.EgressEnabled && spec.Egress {
+		tapName, idx, iface, ipArg, err := s.setupEgress(id)
+		if err != nil {
+			return firecracker.Config{}, bootPaths{}, err
+		}
+		nets = []firecracker.NetworkInterface{iface}
+		kernelArgs += " " + ipArg
+		paths.TapName = tapName
+		paths.TapIndex = idx
+	}
+
 	cfg := firecracker.Config{
 		SocketPath:      socketPath,
 		KernelImagePath: s.cfg.KernelImagePath,
@@ -576,10 +615,7 @@ func (s *Supervisor) buildFirecrackerConfig(id string, cid uint32, spec LaunchSp
 			CID:  cid,
 			Path: vsockPath,
 		}},
-		// No NetworkInterfaces => "none" networking: the guest has loopback only
-		// and cannot reach the host LAN. Egress (if ever enabled) is an explicit
-		// opt-in TAP + Squid allowlist, configured outside this struct.
-		NetworkInterfaces: nil,
+		NetworkInterfaces: nets,
 		VMID:              id,
 	}
 

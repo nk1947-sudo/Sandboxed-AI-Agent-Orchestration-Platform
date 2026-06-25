@@ -319,6 +319,16 @@ func loadConfig() appConfig {
 			CgroupBase:      envStr("CGROUP_BASE", "sandboxes"),
 			MaxConcurrent:   envInt("MAX_CONCURRENT", 0),
 			MemoryBudgetMiB: int64(envInt("MEMORY_BUDGET_MIB", 0)),
+			// Optional compiled seccomp-BPF filter (build-seccomp.sh). Applied on
+			// the non-jailer path; under the jailer Firecracker's built-in filter
+			// is used. Empty = built-in filter.
+			SeccompFilterPath: envStr("SECCOMP_FILTER", ""),
+			// Opt-in egress (default off = none-networking). Requires the host
+			// bridge + nftables + Squid from deploy/ to be set up.
+			EgressEnabled:   envBool("EGRESS_ENABLED", false),
+			EgressGatewayIP: envStr("EGRESS_GATEWAY_IP", "10.200.0.1"),
+			EgressNetmask:   envStr("EGRESS_NETMASK", "255.255.255.0"),
+			EgressTapScript: envStr("EGRESS_TAP_SCRIPT", "scripts/vm-tap.sh"),
 		},
 		redisAddr:             envStr("REDIS_ADDR", "127.0.0.1:6379"),
 		redisPassword:         envStr("REDIS_PASSWORD", ""),
