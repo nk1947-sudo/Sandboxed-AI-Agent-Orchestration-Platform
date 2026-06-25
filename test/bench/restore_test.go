@@ -198,9 +198,26 @@ func BenchmarkPoolAcquire(b *testing.B) {
 	}
 }
 
+// requireJailerForFanout skips tests that restore MORE THAN ONE VM from a single
+// snapshot. A Firecracker snapshot bakes in the absolute host-side vsock UDS path,
+// so every restore re-binds that same path — fan-out works only under the jailer,
+// where each VM has its own chroot and the path is relative and therefore unique.
+// The bench harness runs non-jailer (UseJailer:false), so these are skipped unless
+// BENCH_JAILER=1 (a host with the jailer configured). The single-VM production
+// resume path (StopWithSnapshot → LoadSnapshot) is unaffected by this.
+func requireJailerForFanout(t testing.TB) {
+	t.Helper()
+	if os.Getenv("BENCH_JAILER") == "" {
+		t.Skip("multi-VM snapshot fan-out needs the jailer (per-chroot vsock UDS path); " +
+			"non-jailer restore collides on the snapshot's baked absolute vsock path. " +
+			"Set BENCH_JAILER=1 on a jailer-configured host to run.")
+	}
+}
+
 // TestRestoreUniqueIdentity verifies that two VMs restored from the same
 // snapshot receive distinct IDs, CIDs, and vsock paths.
 func TestRestoreUniqueIdentity(t *testing.T) {
+	requireJailerForFanout(t)
 	env := newBenchEnv(t)
 	sup := env.supervisor(t)
 	ctx := context.Background()
@@ -246,6 +263,7 @@ func TestRestoreUniqueIdentity(t *testing.T) {
 // and not duplicated per-VM. We check that the base memory file size doesn't
 // grow linearly with the number of restores.
 func TestPageSharing(t *testing.T) {
+	requireJailerForFanout(t)
 	env := newBenchEnv(t)
 	sup := env.supervisor(t)
 	ctx := context.Background()
