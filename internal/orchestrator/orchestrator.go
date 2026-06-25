@@ -647,8 +647,16 @@ func (s *Supervisor) buildJailerConfig(id string) *firecracker.JailerConfig {
 // directly and may attach a custom compiled seccomp filter; Firecracker's
 // built-in seccomp filter stays active unless explicitly overridden.
 func (s *Supervisor) newMachine(ctx context.Context, cfg firecracker.Config) (*firecracker.Machine, error) {
+	var opts []firecracker.Opt
+	// Restoring from a snapshot: WithSnapshot swaps the boot handler list for the
+	// load-snapshot one (no boot-source / kernel) and its file validation. Without
+	// it the SDK still PUTs /boot-source and fails with "kernel file cannot be
+	// opened". A zero MemFilePath means a normal cold boot.
+	if cfg.Snapshot.MemFilePath != "" {
+		opts = append(opts, firecracker.WithSnapshot(cfg.Snapshot.MemFilePath, cfg.Snapshot.SnapshotPath))
+	}
 	if cfg.JailerCfg != nil {
-		return firecracker.NewMachine(ctx, cfg)
+		return firecracker.NewMachine(ctx, cfg, opts...)
 	}
 	b := firecracker.VMCommandBuilder{}.
 		WithBin(s.cfg.FirecrackerBin).
@@ -657,7 +665,8 @@ func (s *Supervisor) newMachine(ctx context.Context, cfg firecracker.Config) (*f
 		b = b.AddArgs("--seccomp-filter", s.cfg.SeccompFilterPath)
 	}
 	cmd := b.Build(ctx)
-	return firecracker.NewMachine(ctx, cfg, firecracker.WithProcessRunner(cmd))
+	opts = append(opts, firecracker.WithProcessRunner(cmd))
+	return firecracker.NewMachine(ctx, cfg, opts...)
 }
 
 // prepareCgroup creates a dedicated cgroup v2 leaf and writes its hard caps. It

@@ -10,7 +10,8 @@
 //
 // Snapshot restore flow (LoadSnapshot):
 //  1. Build a firecracker.Config with Config.Snapshot set (not KernelImagePath).
-//  2. Mount a per-VM overlayfs over the golden rootfs (CoW; no full copy).
+//  2. Copy the retained disk (or fall back to the golden rootfs) into a fresh
+//     per-VM file — overlayfs cannot CoW a block image, so a full copy is used.
 //  3. Start the machine — FC restores guest state from the snap files.
 //  4. Re-key: fresh CID, vsock UDS path, entropy seed.
 //
@@ -28,7 +29,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"syscall"
 	"time"
 
 	firecracker "github.com/firecracker-microvm/firecracker-go-sdk"
@@ -178,50 +178,6 @@ func (s *Supervisor) StopWithSnapshot(ctx context.Context, engine *SnapshotEngin
 	return snap, nil
 }
 
-// ── Overlayfs rootfs helpers ───────────────────────────────────────────────
-
-// OverlayMount describes one VM's overlayfs CoW mount.
-type OverlayMount struct {
-	MergedDir string // bind-mount target FC receives as rootfs drive
-	UpperDir  string // per-VM writable CoW layer
-	WorkDir   string // overlayfs work dir (same filesystem as upper)
-	LowerDir  string // read-only golden rootfs (shared across all VMs)
-}
-
-// MountOverlay creates a per-VM overlayfs over goldenRootfs.
-// The merged dir is the path FC should use as its rootfs drive.
-// Requires CAP_SYS_ADMIN (or user-ns overlayfs on kernel ≥ 5.11).
-func MountOverlay(stateDir, id, goldenRootfs string) (OverlayMount, error) {
-	vmDir := filepath.Join(stateDir, id)
-	merged := filepath.Join(vmDir, "rootfs")
-	upper := filepath.Join(vmDir, "overlay-upper")
-	work := filepath.Join(vmDir, "overlay-work")
-
-	for _, d := range []string{merged, upper, work} {
-		if err := os.MkdirAll(d, 0o700); err != nil {
-			return OverlayMount{}, fmt.Errorf("overlay: mkdir %s: %w", d, err)
-		}
-	}
-	opts := fmt.Sprintf("lowerdir=%s,upperdir=%s,workdir=%s", goldenRootfs, upper, work)
-	if err := syscall.Mount("overlay", merged, "overlay", 0, opts); err != nil {
-		return OverlayMount{}, fmt.Errorf("overlay: mount: %w", err)
-	}
-	return OverlayMount{
-		MergedDir: merged, UpperDir: upper, WorkDir: work, LowerDir: goldenRootfs,
-	}, nil
-}
-
-// UnmountOverlay unmounts and removes a VM's overlayfs CoW dirs.
-func UnmountOverlay(m OverlayMount) error {
-	if err := syscall.Unmount(m.MergedDir, 0); err != nil {
-		return fmt.Errorf("overlay: umount %s: %w", m.MergedDir, err)
-	}
-	_ = os.RemoveAll(m.UpperDir)
-	_ = os.RemoveAll(m.WorkDir)
-	_ = os.Remove(m.MergedDir)
-	return nil
-}
-
 // ── Identity re-key on restore ─────────────────────────────────────────────
 
 // RestoredIdentity carries fresh per-instance credentials assigned after
@@ -299,14 +255,23 @@ func (s *Supervisor) LoadSnapshot(ctx context.Context, snap Snapshot, spec Launc
 		paths.HostVsock = vsockPath
 	}
 
-	// Restore the disk to its exact snapshot-time state: copy the retained
-	// snapshot disk into a fresh per-VM file so the resumed VM is independent
-	// and the snapshot stays reusable. Chmod defeats the umask and the gid is
-	// set to the jailer's so the demoted VMM can open the drive O_RDWR — the
-	// same fix the Launch path uses. (overlayfs cannot CoW a block image; the
-	// retained full copy is the correct mechanism.)
+	// Restore the disk into a fresh per-VM file so the resumed VM is independent
+	// and the snapshot stays reusable. Chmod defeats the umask and the gid is set
+	// to the jailer's so the demoted VMM can open the drive O_RDWR — the same fix
+	// the Launch path uses. (overlayfs cannot CoW a block image; a full copy is
+	// the correct mechanism.)
+	//
+	// A snapshot captured with a retained disk (StopWithSnapshot) carries DiskFile
+	// and is byte-consistent with the memory image. A diskless snapshot
+	// (SnapshotEngine.Create — used for fresh golden/pool snapshots) has no
+	// retained disk; fall back to the golden rootfs, which is consistent because
+	// the guest had not yet written to its disk at snapshot time.
+	diskSrc := snap.Paths.DiskFile
+	if diskSrc == "" {
+		diskSrc = s.cfg.RootfsPath
+	}
 	rootfsCopy := filepath.Join(stateDir, "rootfs.ext4")
-	if err := copyFile(snap.Paths.DiskFile, rootfsCopy, 0o660); err != nil {
+	if err := copyFile(diskSrc, rootfsCopy, 0o660); err != nil {
 		s.cids.free(cid)
 		_ = os.RemoveAll(stateDir)
 		return nil, fmt.Errorf("snapshot restore: copy disk: %w", err)
@@ -342,7 +307,9 @@ func (s *Supervisor) LoadSnapshot(ctx context.Context, snap Snapshot, spec Launc
 
 	fcCfg := firecracker.Config{
 		SocketPath: socketPath,
-		// No KernelImagePath — FC restores guest state from the snapshot.
+		// No KernelImagePath/boot-source — newMachine passes firecracker.WithSnapshot
+		// for this config, which swaps in the load-snapshot handler + validation so
+		// FC restores guest + device state from the snapshot files below.
 		Snapshot: firecracker.SnapshotConfig{
 			MemFilePath:         snap.Paths.MemFile,
 			SnapshotPath:        snap.Paths.StateFile,
